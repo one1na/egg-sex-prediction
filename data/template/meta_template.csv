@@ -1,0 +1,4 @@
+﻿egg_id,day,batch,sex,dev,cube,white,dark,wavelengths,拍摄时间,离箱分钟,处理顺序,托盘位置,曝光ms,增益,操作人,备注
+P01-001,0,P01,,,raw/P01-001_d0.hdr,raw/white_P01_d0.hdr,raw/dark_P01_d0.hdr,raw/P01-001_d0.hdr,2026-11-03 09:12,4,7,A3,12,1,,
+P01-001,2,P01,,,raw/P01-001_d2.hdr,raw/white_P01_d2.hdr,raw/dark_P01_d2.hdr,raw/P01-001_d2.hdr,2026-11-05 09:08,5,15,A3,12,1,,
+P01-002,0,P01,,,raw/P01-002_d0.hdr,raw/white_P01_d0.hdr,raw/dark_P01_d0.hdr,raw/P01-002_d0.hdr,2026-11-03 09:13,4,2,A4,12,1,,蛋壳有斑点

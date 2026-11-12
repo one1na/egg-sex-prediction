@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="egg-token" content="__EGG_TOKEN__">
+<title>种蛋性别与发育模型</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="side">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div>
+        <div class="brand-name">种蛋模型</div>
+        <div class="brand-sub">性别与发育预测</div>
+      </div>
+    </div>
+    <nav class="nav" aria-label="页面">
+      <button class="nav-item" data-view="tasks" aria-current="page">运行任务</button>
+      <button class="nav-item" data-view="predictions">判断结果</button>
+      <button class="nav-item" data-view="runs">历史运行</button>
+    </nav>
+    <section class="model-card" aria-label="当前模型">
+      <div class="label">判断新蛋用的模型</div>
+      <div id="model-info" class="model-info">读取中…</div>
+    </section>
+    <p class="side-note">目前只在模拟数据上验证过流程，还不能说明真实种蛋的性别识别准确率。</p>
+  </aside>
+
+  <main class="main">
+    <!-- 运行任务 -->
+    <section class="view" id="view-tasks">
+      <header class="view-head">
+        <h1>运行任务</h1>
+        <p>同一时间只跑一个任务。训练一次要几分钟，页面可以开着不管。</p>
+      </header>
+
+      <div class="grid-2">
+        <form class="panel" id="form-train">
+          <h2>训练模型</h2>
+          <p class="hint">分批交叉验证，和传统方法对比，通过自检后保存最终模型。自检和消融实验只做交叉验证，不看测试集、不保存模型。</p>
+          <label class="field">
+            <span>训练数据表</span>
+            <div class="row">
+              <input type="text" id="train-data" placeholder="不填 = 用模拟数据" spellcheck="false" autocomplete="off">
+              <button type="button" class="btn ghost" data-pick="train-data">选择…</button>
+            </div>
+          </label>
+          <label class="field narrow">
+            <span>决策日</span>
+            <input type="text" id="train-day" inputmode="numeric" placeholder="默认" autocomplete="off">
+            <small>第几天必须出结果，主指标只看这一天。</small>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="train-skip">
+            <span>只重新训练，不看独立测试集<small>测试集只能正式看一次；已经看过之后要勾上才能再训练。</small></span>
+          </label>
+          <div class="actions">
+            <button type="submit" class="btn primary" data-action="train">开始训练</button>
+            <button type="button" class="btn" data-action="self_check">流程自检（打乱标签）</button>
+            <button type="button" class="btn" data-action="ablation">消融实验</button>
+          </div>
+        </form>
+
+        <div class="stack">
+          <form class="panel" id="form-predict">
+            <h2>判断新蛋</h2>
+            <p class="hint">用保存的模型判断没有答案的蛋。</p>
+            <label class="field">
+              <span>要判断的数据表</span>
+              <div class="row">
+                <input type="text" id="predict-data" placeholder="不填 = 用样例数据" spellcheck="false" autocomplete="off">
+                <button type="button" class="btn ghost" data-pick="predict-data">选择…</button>
+              </div>
+            </label>
+            <div class="actions">
+              <button type="submit" class="btn primary" data-action="predict">开始判断</button>
+            </div>
+          </form>
+
+          <div class="panel">
+            <h2>真实光谱检验</h2>
+            <p class="hint">用伊利诺伊大学的公开光谱把整条流程跑一遍。标签是<strong>受精与否，不是性别</strong>，结果只说明流程跑得通；模型不会用来判断新蛋。</p>
+            <div class="actions">
+              <button type="button" class="btn" data-action="fertility_check">开始检验</button>
+              <button type="button" class="btn" data-action="fertility_self_check">先做自检</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <section class="panel console" aria-live="polite">
+        <div class="console-head">
+          <div class="console-title">
+            <span id="task-dot" class="dot idle" aria-hidden="true"></span>
+            <span id="task-status">还没有运行任务</span>
+          </div>
+          <div class="row">
+            <a id="task-open-run" class="btn ghost" hidden>查看这次运行的结果</a>
+            <button type="button" id="task-stop" class="btn danger" hidden>停止</button>
+          </div>
+        </div>
+        <div id="task-message" class="notice" hidden></div>
+        <pre id="task-log" class="log" tabindex="0" aria-label="运行日志"></pre>
+      </section>
+    </section>
+
+    <!-- 判断结果 -->
+    <section class="view" id="view-predictions" hidden>
+      <header class="view-head">
+        <h1>判断结果</h1>
+        <p id="pred-sub">每颗蛋在决策日的判断。</p>
+      </header>
+      <div id="pred-body"></div>
+    </section>
+
+    <!-- 历史运行 -->
+    <section class="view" id="view-runs" hidden>
+      <header class="view-head">
+        <h1>历史运行</h1>
+        <p>每次训练、自检、检验都留有一份完整记录。</p>
+      </header>
+      <div class="runs-layout">
+        <div class="run-list" id="run-list" role="listbox" aria-label="运行列表"></div>
+        <div class="run-detail" id="run-detail"></div>
+      </div>
+    </section>
+  </main>
+</div>
+<div id="tooltip" class="tooltip" role="status" hidden></div>
+<div id="toast" class="toast" role="alert" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>

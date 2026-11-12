@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+
+# 运行结果：模型、预测、每次运行的记录（里面有本机路径，重新运行即可生成）
+output/
+
+# 预处理缓存和样例数据（运行 code/export_sample.py 重新生成）
+_cache/
+data/sample/
+
+# 独立测试集的本机查看记录
+holdout_lock.json
+
+# 本机的备份和杂项
+_改动前备份_*/
+搭建鸡蛋性别预测模型.html
+搭建鸡蛋性别预测模型_files/
