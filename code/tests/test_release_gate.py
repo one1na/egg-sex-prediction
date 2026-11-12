@@ -90,6 +90,7 @@ class TestFinishGate(unittest.TestCase):
                 mock.patch.object(train_demo.report, "log_dev", return_value=[]), \
                 mock.patch.object(train_demo, "self_check", return_value=statuses), \
                 mock.patch.object(train_demo, "run_controls", return_value=controls), \
+                mock.patch.object(train_demo, "supplementary", return_value={}), \
                 mock.patch.object(train_demo.deploy, "train_final") as train_final, \
                 mock.patch.object(train_demo, "run_holdout", return_value=holdout_extra) as run_holdout, \
                 mock.patch.object(train_demo.deploy, "save") as save:

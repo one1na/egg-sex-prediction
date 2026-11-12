@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
+import analysis
 import baseline_fertility
 import deep_train as dt
 import deploy
@@ -362,6 +363,46 @@ def decide(data: EggDataset, cv: CVResult, metrics: report.Metrics, day_idx: int
             "差值": cmp.diff, "差值95%区间": [cmp.ci_low, cmp.ci_high], "单侧p": cmp.p, "深度模型明显更好": better}
 
 
+def supplementary(data: EggDataset, cv: CVResult, metrics: report.Metrics, day_idx: int, best_base: str,
+                  run_dir: Path) -> dict:
+    """补充的统计分析（见 analysis.py）：概率校准、逐日比较（Holm 校正）、失败案例。只报告，不参与选择。"""
+    t, day = day_idx, int(data.days[day_idx])
+    calib, calib_rows = analysis.calibration_report({n: cv.scores[n] for n in (*DEEP_NAMES, *BASELINE_NAMES)},
+                                                    data.sex, t)
+    log.info(f"\n决策日（第 {day} 天）概率校准（折外预测；Brier 越小越好，全猜 0.5 是 0.25；ECE 越小越好）")
+    for name, c in calib.items():
+        note = "" if c["分数是概率"] else "（分数是回归值，不是概率，只能参考）"
+        log.info(f"  {report._pad(name)}判断 {c['判断的蛋数']} 颗，Brier {c['Brier']}，ECE {c['ECE']}{note}")
+
+    per_day = analysis.per_day_comparison(data.days, metrics[PRIMARY_DEEP]["utility"], metrics[best_base]["utility"],
+                                          t, cv.n_train, cv.n_test)
+    better = [r["孵化日"] for r in per_day if r["深度明显更好"]]
+    log.info(f"\n逐日比较 {PRIMARY_DEEP} vs {best_base}（决策日是主检验不校正；其他天是探索性的，p 值按 Holm 校正）")
+    for r in per_day:
+        log.info(f"  第 {r['孵化日']:>2} 天：差值 {r['差值']}，校正后 p {r['校正后p']}  {r['性质']}"
+                 + ("  ← 明显更好" if r["深度明显更好"] else ""))
+
+    methods = [PRIMARY_DEEP, best_base]
+    fails = analysis.failure_rows(data.egg_ids, data.batch, data.sex, cv.fold_of_egg, data.mask[:, t],
+                                  data.mask[:, :t + 1].sum(axis=1), {m: cv.scores[m][:, t] for m in methods})
+    summary = analysis.failure_summary(fails, methods)
+    overview = analysis.failure_overview(fails, summary, methods)
+    log.info(f"\n决策日失败案例：两种方法都判错 {overview['都判错的蛋数']} 颗；"
+             + "；".join(f"{m} 很有把握（分数 > 0.9 或 < 0.1）却判错 {overview[m]['很有把握却判错']} 颗"
+                        for m in methods)
+             + "。明细在 failure_cases.csv（最该回头核对的排在最前），分组错误率在 failure_summary.csv")
+
+    save_csv(run_dir / "calibration.csv", calib_rows)
+    save_csv(run_dir / "per_day_comparison.csv", per_day)
+    save_csv(run_dir / "failure_cases.csv", fails)
+    save_csv(run_dir / "failure_summary.csv", summary)
+    return {"说明": "只报告，不参与选择；都用折外预测，不碰独立测试集",
+            "概率校准（决策日）": calib,
+            "逐日比较": {"基线": best_base, "校正方法": "决策日是主检验不校正；其他天 Holm 校正",
+                         "深度明显更好的孵化日": better},
+            "失败案例（决策日）": overview}
+
+
 SELF_CHECK_PASS, SELF_CHECK_FAIL = "通过", "未通过"
 
 
@@ -479,7 +520,8 @@ def finish(data: EggDataset, hold: EggDataset | None, cv: CVResult, metrics: rep
     chosen = PRIMARY_DEEP if result["深度模型明显更好"] else result["最好的基线"]
     save_csv(run_dir / "dev_mae.csv", report.log_dev(data, cv.dev_pred))
     extra = {"决策日结果": result, "部署方法": chosen, "自检": check_record(self_check(data, cv, metrics, args)),
-             "负对照": run_controls(data, cv.fold_of_egg, day_idx, cv.n_train, cv.n_test)}
+             "负对照": run_controls(data, cv.fold_of_egg, day_idx, cv.n_train, cv.n_test),
+             "补充分析": supplementary(data, cv, metrics, day_idx, result["最好的基线"], run_dir)}
     blockers = release_blockers(extra["自检"], extra["负对照"])
     extra["模型发布"] = {"已发布": not blockers, "未发布原因": blockers}
     if blockers:        # 发布门控：检查没通过就到此为止，不训练最终模型、不碰独立测试集、不写任何模型文件

@@ -38,6 +38,7 @@ MAX_BODY_BYTES = 64 * 1024
 TOKEN_HEADER = "X-Egg-Token"
 TOKEN_PLACEHOLDER = "__EGG_TOKEN__"
 ABLATION_KIND = "消融实验"       # ablation.py 写在 config.json 里的类型
+REPEAT_KIND = "重复交叉验证"     # repeat_cv.py 的
 STATIC_TYPES = {".html": "text/html", ".css": "text/css", ".js": "text/javascript", ".svg": "image/svg+xml"}
 
 log = logging.getLogger("egg_web")
@@ -45,6 +46,7 @@ log = logging.getLogger("egg_web")
 
 # ---------- 任务：要运行哪个脚本、带什么参数 ----------
 ACTION_NAMES = {"train": "训练", "self_check": "流程自检", "predict": "判断新蛋", "ablation": "消融实验",
+                "repeat_cv": "重复交叉验证",
                 "fertility_check": "真实光谱检验", "fertility_self_check": "真实光谱自检"}
 
 
@@ -81,6 +83,8 @@ def build_command(action: str, params: dict) -> tuple[str, list[str]]:
         return name, ["train_demo.py", "--fertility-check", "--shuffle-labels"]
     if action == "ablation":
         return name, ["ablation.py", *_data_arg(params), *_day_arg(params)]
+    if action == "repeat_cv":
+        return name, ["repeat_cv.py", *_data_arg(params), *_day_arg(params)]
     args = ["train_demo.py", *_data_arg(params), *_day_arg(params)]
     if action == "self_check":
         return name, [*args, "--shuffle-labels"]
@@ -218,7 +222,7 @@ def run_status(config: dict | None) -> tuple[str, str]:
         return "incomplete", "没有跑完"
     if "已拦截" in config:
         return "blocked", "已拦截"
-    if config.get("类型") == ABLATION_KIND:
+    if config.get("类型") in (ABLATION_KIND, REPEAT_KIND):
         return "ok", "完成"
     published = (config.get("模型发布") or {}).get("已发布")
     check = (config.get("自检") or {}).get("总体")

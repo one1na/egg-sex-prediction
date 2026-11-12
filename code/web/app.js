@@ -14,6 +14,11 @@ const TABLE_NAMES = {
   "results_per_fold.csv": "按折成绩",
   "decision_day_comparison.csv": "决策日对比",
   "decision_day_per_batch.csv": "按批次",
+  "per_day_comparison.csv": "逐日比较（校正）",
+  "calibration.csv": "概率校准",
+  "failure_summary.csv": "错误分组",
+  "failure_cases.csv": "失败案例",
+  "repeat_cv.csv": "重复交叉验证",
   "holdout.csv": "独立测试集",
   "holdout_调试_非独立验证.csv": "独立测试集（调试）",
   "dev_mae.csv": "发育误差",
@@ -110,7 +115,7 @@ let pollTimer = 0;
 
 function taskParams(action) {
   if (action === "predict") return { data: document.getElementById("predict-data").value };
-  if (action === "train" || action === "self_check" || action === "ablation") {
+  if (action === "train" || action === "self_check" || action === "ablation" || action === "repeat_cv") {
     return {
       data: document.getElementById("train-data").value,
       decision_day: document.getElementById("train-day").value,

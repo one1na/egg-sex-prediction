@@ -52,6 +52,8 @@ class TestBuildCommand(unittest.TestCase):
         self.assertEqual(web_app.build_command("fertility_self_check", {})[1],
                          ["train_demo.py", "--fertility-check", "--shuffle-labels"])
         self.assertEqual(web_app.build_command("ablation", {"decision_day": "4"})[1], ["ablation.py", "--decision-day", "4"])
+        self.assertEqual(web_app.build_command("repeat_cv", {"decision_day": "4"})[1],
+                         ["repeat_cv.py", "--decision-day", "4"])
 
     def test_bad_input_is_explained(self) -> None:
         with self.assertRaisesRegex(ValueError, "找不到数据表"):
@@ -163,6 +165,7 @@ class TestRuns(RunsCase):
         self.assertEqual(web_app.run_status({"决策日结果": {}, "自检通过": False})[0], "failed")
         self.assertEqual(web_app.run_status({"决策日结果": {}, "自检通过": True})[0], "ok")
         self.assertEqual(web_app.run_status({"时间": "只写了开头"})[0], "incomplete")
+        self.assertEqual(web_app.run_status({"类型": "重复交叉验证", "汇总": {}}), ("ok", "完成"))
 
     def test_names_cannot_escape_the_folder(self) -> None:
         (self.root / "secret.csv").write_text("a\n1\n", encoding="utf-8")
