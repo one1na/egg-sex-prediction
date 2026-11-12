@@ -113,13 +113,21 @@ class TestEnviThroughLoader(TempDir):
         self.assertAlmostEqual(float(data.spec[0, 0].mean()), 0.5, delta=0.02)
 
     def test_changing_data_file_invalidates_cache(self) -> None:
+        """指纹按内容算：数据文件换了内容，哪怕大小和修改时间都改回原样，缓存也作废。"""
         rows = real_data.read_meta(self.dir / "meta.csv", real_data.TRAIN_COLUMNS)
         before = real_data._fingerprint(self.dir / "meta.csv", rows)
         raw = self.dir / "egg.raw"
+        stat = raw.stat()
         raw.write_bytes(raw.read_bytes()[::-1])
-        stat = raw.stat()       # 指纹看大小和修改时间；紧接着改写时修改时间可能落在同一个时钟刻度里，这里明确推后 1 秒
-        os.utime(raw, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+        os.utime(raw, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        self.assertEqual((raw.stat().st_size, raw.stat().st_mtime_ns), (stat.st_size, stat.st_mtime_ns))
         self.assertNotEqual(before, real_data._fingerprint(self.dir / "meta.csv", rows))
+        os.utime(raw, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))      # 只改时间、不改内容：缓存照用
+        self.assertEqual(real_data._fingerprint(self.dir / "meta.csv", rows),
+                         real_data._fingerprint(self.dir / "meta.csv", rows))
+        manifest = real_data.content_manifest(self.dir / "meta.csv", rows)
+        self.assertIn("egg.raw", manifest)
+        self.assertEqual(len(manifest["egg.raw"]), 64)
 
 
 if __name__ == "__main__":

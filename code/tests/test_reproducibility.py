@@ -134,6 +134,21 @@ class TestDeterminism(unittest.TestCase):
             outs.append(dt.predict_scores(trained, data.x, data.mask, data.days)["cum"])
         np.testing.assert_array_equal(outs[0], outs[1])
 
+    def test_strict_mode_errors_instead_of_warning_and_training_still_runs(self) -> None:
+        import torch
+        data = make_dataset(n_eggs=12, seed=0)
+        try:
+            run_record.set_determinism(7, strict=True)
+            self.assertTrue(torch.are_deterministic_algorithms_enabled())
+            self.assertFalse(torch.is_deterministic_algorithms_warn_only_enabled())
+            dt.train_fixed_epochs(data, np.arange(len(data.sex)), 0.5, seed=7, epochs=1)   # 用到的算子都有确定性实现
+        finally:
+            run_record.set_determinism(7)
+        self.assertTrue(torch.is_deterministic_algorithms_warn_only_enabled())
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIn("严格", run_record.reproducibility(Path(tmp), strict=True)["确定性"])
+        self.assertIn("CPU", run_record.environment())
+
 
 if __name__ == "__main__":
     unittest.main()

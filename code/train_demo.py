@@ -35,11 +35,11 @@ import deploy
 import holdout_lock
 import report
 import run_record
-from baselines import (BASELINE_NAMES, LOGREG_C, MATCHED_NAMES, PLS_COMPONENTS, PRIMARY_BASELINE, matched_name,
-                       per_day_baselines)
+from baselines import (BASELINE_NAMES, CARRY_SUFFIX, HISTORY_SUFFIX, INFO_MATCHED_NAMES, LOGREG_C, MATCHED_NAMES,
+                       PLS_COMPONENTS, PRIMARY_BASELINE, info_matched, matched_name, per_day_baselines)
 from controls import run_controls
 from deep_train import PRIMARY_DEEP
-from evaluation import (CHANCE_PASS, CHANCE_UNKNOWN, MIN_HOLDOUT_BATCHES, PRIMARY_METRIC, WILSON_LABEL, batch_utilities,
+from evaluation import (ALPHA, CHANCE_PASS, CHANCE_UNKNOWN, MIN_HOLDOUT_BATCHES, PRIMARY_METRIC, WILSON_LABEL, batch_utilities,
                         common_accuracy, compare_paired,
                         fold_day_metrics, holdout_split, pooled_utility)
 from isolation import FoldPlan, IsolationError, audit, plan_folds
@@ -102,6 +102,10 @@ def parse_args() -> argparse.Namespace:
                         help="调试模式：允许再次查看已经看过的独立测试集，结果一律标注“非独立验证”")
     parser.add_argument("--allow-no-batch", action="store_true",
                         help="允许数据没有批次信息（每颗蛋自成一组）；结果不能当作对新批次的性能")
+    parser.add_argument("--strict-determinism", action="store_true",
+                        help="严格确定性：遇到没有确定性实现的 PyTorch 算子直接报错（默认只警告）；正式复现实验用")
+    parser.add_argument("--allow-ungrouped-val", action="store_true",
+                        help="真实数据批次太少、早停验证没法按批次分时，允许按蛋随机分（早停结果不能当作对新批次的泛化）")
     parser.add_argument("--fertility-check", action="store_true",
                         help="流水线检验：用伊利诺伊公开的真实平均光谱（标签是受精状态，不是性别）把整条流程跑一遍；"
                              "不保存判断新蛋用的模型")
@@ -278,7 +282,7 @@ def run_fold(data: EggDataset, plan: FoldPlan, dev_weight: float,
     log.info(f"  训练 {len(fit_idx)} 颗 + 早停验证 {len(val_idx)} 颗（{'按批次' if grouped else '按蛋随机'}分），"
              f"测试 {len(test_idx)} 颗；深度模型第 {trained.epochs} 轮最好；用时 {time.time() - start:.0f} 秒")
     scores = {"深度-单帧": deep["frame"], PRIMARY_DEEP: deep["cum"], **base,
-              **{matched_name(name): s for name, s in matched.items()}}
+              **{matched_name(name): s for name, s in matched.items()}, **info_matched(base)}
     return scores, deep["dev"], trained.epochs, len(fit_idx)
 
 
@@ -287,7 +291,8 @@ def cross_validate(data: EggDataset, dev_weight: float, plans: list[FoldPlan]) -
     folds = [(p.train, p.test) for p in plans]
     log.info(f"\n开发集 {len(data.sex)} 颗蛋，按批次分组做 {len(folds)} 折交叉验证")
     n_eggs, n_days = data.mask.shape
-    scores = {name: np.full((n_eggs, n_days), np.nan) for name in (*DEEP_NAMES, *BASELINE_NAMES, *MATCHED_NAMES)}
+    scores = {name: np.full((n_eggs, n_days), np.nan)
+              for name in (*DEEP_NAMES, *BASELINE_NAMES, *MATCHED_NAMES, *INFO_MATCHED_NAMES)}
     dev_pred = np.full((n_eggs, n_days), np.nan)
     fold_of_egg = np.full(n_eggs, -1)
     epochs, n_fit = [], []
@@ -357,10 +362,12 @@ def decide(data: EggDataset, cv: CVResult, metrics: report.Metrics, day_idx: int
     cmp_matched = compare_paired(primary[PRIMARY_DEEP], primary[matched], cv.n_fit, cv.n_test)
     better_matched = report.log_matched(PRIMARY_DEEP, matched, cmp_matched, PRIMARY_METRIC, better)
     exploratory = exploratory_comparisons(primary, cv, best_base)
+    same_info = info_matched_report(primary, metrics, cv, day_idx, best_base, better)
     save_csv(run_dir / "decision_day_comparison.csv", report.comparison_rows(metrics, day_idx, PRIMARY_DEEP, common))
     best = common[best_base]
     return {"主指标": PRIMARY_METRIC, "深度模型": PRIMARY_DEEP, "主比较基线": best_base,
             "主比较基线的来历": "事先指定（不按交叉验证成绩挑选）", "探索性比较": exploratory,
+            "同信息对照": same_info,
             "同样本量对照": {"说明": "基线只用深度模型拟合用的那部分蛋训练（不含早停验证集）；只报告，不参与选择",
                              "基线": matched, "平均每折拟合蛋数": cv.n_fit, "平均每折训练蛋数": cv.n_train,
                              "基线决策效用": report.num_or_none(report.nanmean(primary[matched])),
@@ -376,6 +383,33 @@ def decide(data: EggDataset, cv: CVResult, metrics: report.Metrics, day_idx: int
             "基线覆盖率": report.nanmean(metrics[best_base]["coverage"][:, day_idx]),
             "共同可判断蛋上深度模型准确率": report.nanmean(best.acc_a), "共同可判断蛋上基线准确率": report.nanmean(best.acc_b),
             "差值": cmp.diff, "差值95%区间": [cmp.ci_low, cmp.ci_high], "单侧p": cmp.p, "深度模型明显更好": better}
+
+
+def info_matched_report(primary: dict[str, np.ndarray], metrics: report.Metrics, cv: CVResult, day_idx: int,
+                        base: str, formal_better: bool) -> dict:
+    """同信息对照：主比较基线也用这颗蛋决策日及以前的图像（沿用最近 / 历史平均），覆盖率和深度-累计一样。
+    深度模型对它们也明显更好，才说明好在时序建模；正式比较里的优势在这里消失，说明主要是缺图时有东西可用。只报告。"""
+    rows = []
+    for name in (base + CARRY_SUFFIX, base + HISTORY_SUFFIX):
+        c = compare_paired(primary[PRIMARY_DEEP], primary[name], cv.n_train, cv.n_test)
+        rows.append({"基线": name, "基线决策效用": report.num_or_none(report.nanmean(primary[name])),
+                     "基线覆盖率": report.num_or_none(report.nanmean(metrics[name]["coverage"][:, day_idx])),
+                     "差值": report.num_or_none(c.diff), "单侧p（未校正）": report.num_or_none(c.p),
+                     "深度模型明显更好": bool(c.p < ALPHA)})
+    still = all(r["深度模型明显更好"] for r in rows)
+    if not formal_better:
+        verdict = "正式比较里深度模型就没有明显更好，这里只作参考"
+    elif still:
+        verdict = "基线也用上历史图像后深度模型仍然明显更好：优势不只是缺图时有东西可用，时序建模可能有贡献"
+    else:
+        verdict = "基线也用上历史图像后深度模型不再明显更好：正式比较里的优势可能主要来自缺图时有历史图像可用，不能归功于时序建模"
+    log.info(f"  同信息对照（只报告，不参与选择）：{base} 也用这颗蛋决策日及以前的图像")
+    for r in rows:
+        log.info(f"    {PRIMARY_DEEP} vs {r['基线']}：基线覆盖率 {r['基线覆盖率']}，差值 {r['差值']}，"
+                 f"单侧 p {r['单侧p（未校正）']}（未校正）")
+    log.info(f"    → {verdict}")
+    return {"说明": "基线只用这颗蛋自己决策日及以前的图像，和深度-累计能用的信息一样；只报告，不参与选择",
+            "比较": rows, "结论": verdict}
 
 
 def exploratory_comparisons(primary: dict[str, np.ndarray], cv: CVResult, primary_base: str) -> list[dict]:
@@ -449,9 +483,9 @@ def self_check(data: EggDataset, cv: CVResult, metrics: report.Metrics,
     """打乱标签时检查所有天；模拟数据正常训练时检查没有性别信号的第 0 天；真实数据正常训练不检查。
 
     返回 {方法: 通过/报警/无法确认}，没做检查返回 None。
-    同样本量对照的基线只是报告用的对照，不进自检：免得多出来的方法凭空增加误报，把发布门控卡住。
+    同样本量对照和同信息对照只是报告用的对照，不进自检：免得多出来的方法凭空增加误报，把发布门控卡住。
     """
-    metrics = {name: m for name, m in metrics.items() if name not in MATCHED_NAMES}
+    metrics = {name: m for name, m in metrics.items() if name not in (*MATCHED_NAMES, *INFO_MATCHED_NAMES)}
     if args.shuffle_labels:
         statuses = report.log_chance(metrics, list(range(len(data.days))), cv.n_train, cv.n_test,
                                      "流程自检：打乱标签后，每种方法所有孵化日合起来的准确率"
@@ -475,6 +509,11 @@ def check_record(statuses: dict[str, str] | None) -> dict | None:
 
 GATE_PASS, GATE_FAIL, GATE_NOT_RUN, GATE_NA = "通过", "未通过", "未执行", "不适用"
 MODE_FORMAL, MODE_DEMO = "正式", "演示"
+
+
+def strict_val(args: argparse.Namespace) -> bool:
+    """正式模式下早停验证必须按批次分（isolation.audit 的 strict_val），除非明确加了 --allow-ungrouped-val。"""
+    return gate_mode(args) == MODE_FORMAL and not getattr(args, "allow_ungrouped_val", False)
 
 
 def gate_mode(args: argparse.Namespace) -> str:
@@ -661,12 +700,12 @@ def main() -> int:
         kind = "真实光谱自检" if args.shuffle_labels else "真实光谱检验"
     run_dir = new_run_dir(kind)
     attach_log(run_dir)
-    set_determinism(SEED)
+    set_determinism(SEED, args.strict_determinism)
     if args.fertility_check:
         log.warning(FERTILITY_NOTE)
     raw = load_unshuffled(args)
     data_all = shuffle_labels(raw) if args.shuffle_labels else raw
-    repro = reproducibility(run_dir, data_all, args.data)
+    repro = reproducibility(run_dir, data_all, args.data, args.strict_determinism)
     if args.shuffle_labels:         # 正式训练的发布门控靠它找到对应的自检：数据指纹要和打乱之前比
         repro["打乱前数据指纹"] = data_fingerprint(raw, args.data)
     check_batches(data_all, args)
@@ -686,7 +725,7 @@ def main() -> int:
 
     plans = plan_folds(data, N_FOLDS, SEED)
     try:
-        isolation = audit(data, hold, plans)
+        isolation = audit(data, hold, plans, strict_val(args))
     except IsolationError as e:
         log.error(f"\n!!! {e}")
         save_json(run_dir / "config.json", {"时间": datetime.now().isoformat(timespec="seconds"),

@@ -18,6 +18,7 @@ meta.csv 每行是一次采集，列为：
 """
 import csv
 import hashlib
+import json
 import logging
 import os
 from collections.abc import Callable
@@ -34,7 +35,8 @@ from paths import CACHE_DIRNAME
 from run_record import save_csv
 from synth_data import EggDataset
 
-CACHE_VERSION = 3            # 缓存文件格式变了就加 1；预处理代码的改动会自动让缓存作废
+CACHE_VERSION = 4            # 缓存文件格式变了就加 1；预处理代码的改动会自动让缓存作废
+HASH_CHUNK = 1 << 20         # 算文件内容指纹时每次读 1 MB
 LOG_EVERY = 50               # 预处理时每多少次采集报一次进度
 MAT_VARIABLE: str | None = None   # .mat 文件里图像变量的名字（如 "spec"）；None = 文件里只有一个变量时自动用它
 WAVELENGTH_TOLERANCE = 0.5   # 不同采集的波长允许相差多少 nm
@@ -258,20 +260,48 @@ def _code_version() -> bytes:
     return b"".join(Path(m).read_bytes() for m in (calibration.__file__, roi.__file__, envi.__file__, __file__))
 
 
-def _fingerprint(csv_file: Path, rows: list[Row]) -> str:
-    """缓存的身份：缓存格式、预处理代码、每个图像和波长文件的路径、大小、修改时间。标签列不影响缓存。"""
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(HASH_CHUNK), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _row_files(csv_file: Path, r: Row) -> list[Path]:
+    """一次采集用到的全部原始文件（图像、参考板、波长；ENVI 连上数据文件）。"""
+    files = []
+    for name in (_cell(r, "cube"), *_ref_names(r), _cell(r, "wavelengths")):
+        if not name:
+            continue
+        path = csv_file.parent / name
+        if not path.exists():
+            raise FileNotFoundError(f"{_where(r)}：找不到文件 {path}")
+        files.extend(_source_files(path))
+    return files
+
+
+def content_manifest(csv_file: Path, rows: list[Row]) -> dict[str, str]:
+    """原始文件的内容哈希清单：{相对数据表的路径: sha256}。按内容算，不看大小和修改时间——
+    文件被换掉而大小、时间恰好没变（复制工具保留时间、手工改回时间）也认得出来。数据大时第一次会慢一些。"""
+    manifest = {}
+    for r in rows:
+        for part in _row_files(csv_file, r):
+            key = os.path.relpath(part, csv_file.parent).replace(os.sep, "/")
+            if key not in manifest:
+                manifest[key] = _file_sha256(part)
+    return manifest
+
+
+def _fingerprint(csv_file: Path, rows: list[Row], manifest: dict[str, str] | None = None) -> str:
+    """缓存的身份：缓存格式、预处理代码、每次采集用到的原始文件的路径和内容哈希。标签列不影响缓存。"""
+    manifest = content_manifest(csv_file, rows) if manifest is None else manifest
     h = hashlib.sha1(f"{CACHE_VERSION}|{MAT_VARIABLE}|".encode() + _code_version())
     for r in rows:
         h.update(f"|{r['egg_id']}|{_day(r)}".encode())
-        for name in (_cell(r, "cube"), *_ref_names(r), _cell(r, "wavelengths")):
-            if not name:
-                continue
-            path = csv_file.parent / name
-            if not path.exists():
-                raise FileNotFoundError(f"{_where(r)}：找不到文件 {path}")
-            for part in _source_files(path):
-                st = part.stat()
-                h.update(f"|{part.name}|{st.st_size}|{st.st_mtime_ns}".encode())
+        for part in _row_files(csv_file, r):
+            key = os.path.relpath(part, csv_file.parent).replace(os.sep, "/")
+            h.update(f"|{key}|{manifest[key]}".encode())
     return h.hexdigest()[:16]
 
 
@@ -308,8 +338,10 @@ def _write_cache(path: Path, frames: EggFrames, masks: dict[str, np.ndarray]) ->
 
 
 def load_frames(csv_file: Path, rows: list[Row]) -> EggFrames:
-    """图像文件和预处理代码都没变就读缓存，否则重新预处理并写缓存。"""
-    cache = csv_file.parent / CACHE_DIRNAME / f"{_fingerprint(csv_file, rows)}.npz"
+    """图像文件（按内容）和预处理代码都没变就读缓存，否则重新预处理并写缓存。
+    缓存旁边另存一份原始文件的内容哈希清单（<指纹>_manifest.json），日后可以核对用的是哪些原始文件。"""
+    manifest = content_manifest(csv_file, rows)
+    cache = csv_file.parent / CACHE_DIRNAME / f"{_fingerprint(csv_file, rows, manifest)}.npz"
     if cache.exists():
         try:
             frames = _read_cache(cache)
@@ -328,6 +360,9 @@ def load_frames(csv_file: Path, rows: list[Row]) -> EggFrames:
                          f"例如蛋 {first['egg_id']} 第 {first['day']} 天（{first['cube']}）：{first['失败原因']}")
     _log_retention(qc_rows)
     _write_cache(cache, frames, masks)
+    cache.with_name(f"{cache.stem}_manifest.json").write_text(
+        json.dumps({"说明": "原始文件的内容哈希（sha256），路径相对数据表", "文件": manifest}, ensure_ascii=False, indent=2),
+        encoding="utf-8")
     return frames
 
 

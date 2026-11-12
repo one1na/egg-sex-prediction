@@ -26,6 +26,38 @@ def matched_name(name: str) -> str:
 
 MATCHED_NAMES = tuple(matched_name(name) for name in BASELINE_NAMES)
 
+# 同信息对照：深度-累计在决策日没拍图像时会用之前几天的图像，基线却只看当天。为了分清"时序建模的收益"
+# 和"缺图时有东西可用的收益"，基线也给同样的历史信息（只用这颗蛋自己在决策日及以前的图像，不碰别的蛋）：
+# ·沿用最近 = 用最近一次有图像那天的模型分数；·历史平均 = 到这一天为止所有有图像那天分数的平均。
+CARRY_SUFFIX, HISTORY_SUFFIX = "·沿用最近", "·历史平均"
+INFO_MATCHED_NAMES = tuple(name + suffix for name in BASELINE_NAMES for suffix in (CARRY_SUFFIX, HISTORY_SUFFIX))
+
+
+def carry_forward(scores: np.ndarray) -> np.ndarray:
+    """(N, T) 分数：没有图像的那天沿用之前最近一次的分数；之前一次都没有仍然是 nan。"""
+    out = scores.astype(float, copy=True)
+    for t in range(1, out.shape[1]):
+        missing = np.isnan(out[:, t])
+        out[missing, t] = out[missing, t - 1]
+    return out
+
+
+def history_mean(scores: np.ndarray) -> np.ndarray:
+    """(N, T) 分数：到每一天为止（含当天）所有有图像那天分数的平均；之前一次都没有是 nan。"""
+    valid = ~np.isnan(scores)
+    total = np.cumsum(np.where(valid, scores, 0.0), axis=1)
+    count = np.cumsum(valid, axis=1)
+    return np.where(count > 0, total / np.maximum(count, 1), np.nan)
+
+
+def info_matched(base_scores: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """由每天单独打分的基线分数，算出两种同信息对照的分数（不重新训练）。"""
+    out = {}
+    for name in BASELINE_NAMES:
+        out[name + CARRY_SUFFIX] = carry_forward(base_scores[name])
+        out[name + HISTORY_SUFFIX] = history_mean(base_scores[name])
+    return out
+
 
 class PLSDA(BaseEstimator, ClassifierMixin):
     """PLS-DA：光谱领域最常用的分类方法。回归值大于 0.5 判为 1。"""

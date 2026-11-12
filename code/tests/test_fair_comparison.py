@@ -1,4 +1,5 @@
-"""公平比较：基线的同样本量对照（只用深度模型拟合的那部分蛋训练），以及以批次为单位的区间。"""
+"""公平比较：基线的同样本量对照（只用深度模型拟合的那部分蛋训练）、同信息对照（基线也用历史图像），
+以及以批次为单位的区间。"""
 import argparse
 import logging
 import sys
@@ -11,6 +12,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 logging.disable(logging.WARNING)
 
+import ablation  # noqa: E402
+import baselines  # noqa: E402
 import report  # noqa: E402
 import train_demo  # noqa: E402
 from isolation import FoldPlan  # noqa: E402
@@ -133,7 +136,7 @@ class TestMatchedBaseline(unittest.TestCase):
             self.assertEqual(scores[matched_name(name)][0, 0], len(fit_idx))
 
     def test_matched_baselines_stay_out_of_self_check(self) -> None:
-        metrics = {name: {} for name in ("深度-累计", *BASELINE_NAMES, *MATCHED_NAMES)}
+        metrics = {name: {} for name in ("深度-累计", *BASELINE_NAMES, *MATCHED_NAMES, *baselines.INFO_MATCHED_NAMES)}
         cv = mock.Mock(n_train=8.0, n_test=4.0)
         args = argparse.Namespace(shuffle_labels=True, data=None)
         with mock.patch.object(train_demo.report, "log_chance", return_value={"深度-累计": "通过"}) as log_chance:
@@ -155,6 +158,56 @@ class TestMatchedBaseline(unittest.TestCase):
         finally:
             logging.disable(logging.WARNING)
         self.assertTrue(any("结论不一致" in line for line in logs.output))
+
+
+nan = float("nan")
+
+
+class TestInfoMatchedBaseline(unittest.TestCase):
+    """同信息对照：基线也能用这颗蛋决策日及以前的图像，覆盖率和深度-累计一样。"""
+
+    def test_carry_forward_uses_latest_earlier_score_only(self) -> None:
+        s = np.array([[0.9, nan, nan, 0.2], [nan, 0.4, nan, nan], [nan, nan, nan, nan]])
+        np.testing.assert_array_equal(baselines.carry_forward(s),
+                                      [[0.9, 0.9, 0.9, 0.2], [nan, 0.4, 0.4, 0.4], [nan, nan, nan, nan]])
+        self.assertTrue(np.isnan(s[0, 1]))                                     # 不改原数组
+
+    def test_history_mean_averages_days_so_far(self) -> None:
+        s = np.array([[0.9, nan, 0.3, 0.6], [nan, nan, nan, nan]])
+        np.testing.assert_allclose(baselines.history_mean(s), [[0.9, 0.9, 0.6, 0.6], [nan, nan, nan, nan]])
+
+    def test_never_looks_at_later_days(self) -> None:
+        rng = np.random.default_rng(0)
+        s = np.where(rng.random((20, 6)) < 0.4, nan, rng.random((20, 6)))
+        later = s.copy()
+        later[:, 3:] = rng.random((20, 3))                                    # 只改第 3 天以后
+        for f in (baselines.carry_forward, baselines.history_mean):
+            np.testing.assert_array_equal(f(s)[:, :3], f(later)[:, :3])
+
+    def test_fold_scores_include_info_matched(self) -> None:
+        base = {name: np.array([[0.8, nan]]) for name in BASELINE_NAMES}
+        out = baselines.info_matched(base)
+        self.assertEqual(set(out), set(baselines.INFO_MATCHED_NAMES))
+        self.assertEqual(out["PLS-DA·沿用最近"][0, 1], 0.8)
+        self.assertEqual(out["PLS-DA·历史平均"][0, 1], 0.8)
+
+    def test_report_verdicts(self) -> None:
+        names = ["深度-累计", "PLS-DA·沿用最近", "PLS-DA·历史平均"]
+        primary = {n: np.array([0.7, 0.72, 0.71]) for n in names}
+        metrics = {n: {"coverage": np.ones((3, 1))} for n in names}
+        cv = mock.Mock(n_train=8.0, n_test=4.0)
+        with mock.patch.object(train_demo, "compare_paired", return_value=Paired(0.0, -0.1, 0.1, 0.5)):
+            r = train_demo.info_matched_report(primary, metrics, cv, 0, "PLS-DA", True)
+        self.assertIn("不能归功于时序建模", r["结论"])
+        with mock.patch.object(train_demo, "compare_paired", return_value=Paired(0.2, 0.1, 0.3, 0.001)):
+            r = train_demo.info_matched_report(primary, metrics, cv, 0, "PLS-DA", True)
+        self.assertIn("时序建模可能有贡献", r["结论"])
+        self.assertEqual([x["基线"] for x in r["比较"]], names[1:])
+
+    def test_ablation_has_coverage_matched_temporal_variant(self) -> None:
+        v = next(v for v in ablation.build_variants(stub(4), 0.0) if v.output == "frame_carry")
+        self.assertTrue(v.reuse_full)
+        self.assertIn("沿用最近", v.name)
 
 
 if __name__ == "__main__":

@@ -27,7 +27,7 @@ from evaluation import ALPHA, PRIMARY_METRIC, compare_paired, fold_day_metrics
 from isolation import audit, plan_folds
 from run_record import attach_log, environment, new_run_dir, reproducibility, save_csv, save_json, set_determinism
 from train_demo import (DECISION_DAY, N_FOLDS, SEED, check_batches, cross_validate, decision_index, load_data,
-                        split_holdout)
+                        split_holdout, strict_val)
 
 REPEATS = 5
 SEED_STEP = 1000                # 第 r 遍（从 0 数）的分折种子 = SEED + r * SEED_STEP
@@ -37,10 +37,10 @@ SYNTH_NOTE = ("★ 这是模拟数据：性别信号是人为放进去的。这�
 log = logging.getLogger("egg_train")
 
 
-def one_repeat(data, dev_weight: float, day_idx: int, seed: int) -> dict:
-    """用 seed 分折跑一遍交叉验证，按正式规则比较，返回这一遍的结果。"""
+def one_repeat(data, dev_weight: float, day_idx: int, seed: int, strict: bool = False) -> dict:
+    """用 seed 分折跑一遍交叉验证，按正式规则比较，返回这一遍的结果。strict：正式模式，早停验证必须按批次分。"""
     plans = plan_folds(data, N_FOLDS, seed)
-    audit(data, None, plans)
+    audit(data, None, plans, strict)
     cv = cross_validate(data, dev_weight, plans)
     utility = {name: fold_day_metrics(s, data.sex, cv.fold_of_egg, cv.n_folds)[PRIMARY_METRIC][:, day_idx]
                for name, s in cv.scores.items() if name in (PRIMARY_DEEP, PRIMARY_BASELINE)}
@@ -77,6 +77,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decision-day", type=int, default=DECISION_DAY, help="看哪个孵化日的结果")
     parser.add_argument("--repeats", type=int, default=REPEATS, help=f"重复几遍（默认 {REPEATS}，至少 2）")
     parser.add_argument("--allow-no-batch", action="store_true", help="允许数据没有批次信息（结果不能当作对新批次的性能）")
+    parser.add_argument("--allow-ungrouped-val", action="store_true",
+                        help="真实数据批次太少、早停验证没法按批次分时，允许按蛋随机分（早停结果不能当作对新批次的泛化）")
     args = parser.parse_args()
     if args.repeats < 2:
         parser.error("--repeats 至少是 2")
@@ -97,7 +99,7 @@ def main() -> int:
     day_idx = decision_index(data_all.days, args.decision_day)
     dev_weight = dt.DEV_LOSS_WEIGHT if data_all.dev_mask.any() else 0.0
     data, hold = split_holdout(data_all, args)
-    audit(data, hold, plan_folds(data, N_FOLDS, SEED))
+    audit(data, hold, plan_folds(data, N_FOLDS, SEED), strict_val(args))
     log.info("重复交叉验证只用开发集：" + ("独立测试集不参加、不评估，查看次数不变" if hold is not None else "这份数据没有留独立测试集"))
     del hold
 
@@ -105,7 +107,7 @@ def main() -> int:
     for r in range(args.repeats):
         seed = SEED + r * SEED_STEP
         log.info(f"\n===== 第 {r + 1}/{args.repeats} 遍（分折种子 {seed}{'，和正式训练相同' if r == 0 else ''}）=====")
-        rows.append({"遍": r + 1, **one_repeat(data, dev_weight, day_idx, seed)})
+        rows.append({"遍": r + 1, **one_repeat(data, dev_weight, day_idx, seed, strict_val(args))})
         x = rows[-1]
         log.info(f"第 {r + 1} 遍：深度 {x['深度决策效用']}，基线 {x['主比较基线']} {x['基线决策效用']}，"
                  f"差值 {x['差值']}，p {x['单侧p']}，按规则部署 {x['按规则部署']}")

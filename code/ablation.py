@@ -8,7 +8,9 @@
 - 要比哪几项在下面写死，全部报告；显著性门槛按比较的项数做 Bonferroni 校正，免得项数一多总有碰巧"显著"的。
 
 变体：
-- 深度模型：去掉时序（改用单帧输出，不另外训练）、去掉空间信息（每帧只给蛋区域的平均光谱）、
+- 深度模型：去掉时序（改用单帧输出，不另外训练；另有一项"单帧输出·沿用最近"：决策日没拍图像的蛋沿用
+  最近一次单帧分数，覆盖率和完整模型一样，用来分清时序建模本身的贡献和"缺图时有东西可用"的贡献）、
+  去掉空间信息（每帧只给蛋区域的平均光谱）、
   去掉发育任务（发育损失权重设 0）、依次去掉一段波段。
 - 基线 PLS-DA：去掉 SNV 预处理、依次去掉一段波段。
 
@@ -27,13 +29,14 @@ from typing import Callable
 import numpy as np
 
 import deep_train as dt
-from baselines import per_day_baselines
+from baselines import carry_forward, per_day_baselines
 from evaluation import (ALPHA, PRIMARY_METRIC, Paired, batch_utilities, compare_paired, fold_day_metrics,
                         group_interval)
 from isolation import FoldPlan, audit, plan_folds
 from run_record import attach_log, environment, new_run_dir, reproducibility, save_csv, save_json, set_determinism
 from synth_data import EggDataset
-from train_demo import DECISION_DAY, N_FOLDS, SEED, check_batches, decision_index, load_data, split_holdout
+from train_demo import (DECISION_DAY, N_FOLDS, SEED, check_batches, decision_index, load_data, split_holdout,
+                        strict_val)
 
 BAND_GROUPS = 4                 # 波段消融：按波长顺序平分成几段，每次去掉一段
 MIN_BANDS_PER_GROUP = 2         # 每段至少这么多个波段，不够就不做波段消融
@@ -56,7 +59,7 @@ class Variant:
     question: str                       # 这个变体回答什么问题
     transform: Transform | None = None  # 对数据做什么改动；None = 不改
     dev_weight: float | None = None     # 深度模型的发育损失权重；None = 和完整模型一样
-    output: str = "cum"                 # 深度模型用哪个输出：cum 累计，frame 单帧
+    output: str = "cum"                 # 深度模型用哪个输出：cum 累计，frame 单帧，frame_carry 单帧沿用最近
     reuse_full: bool = False            # True = 不另外训练，直接用完整模型的另一个输出
     use_snv: bool = True                # 基线是否做 SNV
 
@@ -103,7 +106,10 @@ def group_label(group: np.ndarray, wavelengths: np.ndarray | None) -> str:
 def build_variants(data: EggDataset, dev_weight: float) -> tuple[Variant, ...]:
     """这次要比的全部变体，事先定好。数据不支持的项不做（并在日志里说明），不会悄悄少一项。"""
     variants = [Variant(FULL_DEEP, "深度", "对照：什么都不去掉"),
-                Variant("深度：去掉时序（单帧输出）", "深度", "把多天串起来比只看当天强多少", output="frame", reuse_full=True)]
+                Variant("深度：去掉时序（单帧输出）", "深度", "把多天串起来比只看当天强多少", output="frame", reuse_full=True),
+                Variant("深度：去掉时序（单帧输出·沿用最近）", "深度",
+                        "覆盖率拉平后（缺图的蛋沿用最近一次单帧分数），时序建模本身有没有用",
+                        output="frame_carry", reuse_full=True)]
     if data.x.shape[3] * data.x.shape[4] > 1:
         variants.append(Variant("深度：去掉空间信息（只用平均光谱）", "深度", "蛋内的空间分布有没有用", transform=no_spatial))
     else:
@@ -154,7 +160,8 @@ def run_ablation(data: EggDataset, dev_weight: float, variants: tuple[Variant, .
             if v.family == "基线":
                 out = per_day_baselines(view.spec, view.mask, view.sex, train_idx, test_idx, use_snv=v.use_snv)[BASELINE]
             elif v.reuse_full:
-                out = full[v.output]        # 完整模型排在最前面，这里一定已经训练过
+                # 完整模型排在最前面，这里一定已经训练过
+                out = carry_forward(full["frame"]) if v.output == "frame_carry" else full[v.output]
             else:
                 weight = dev_weight if v.dev_weight is None else v.dev_weight
                 deep = _deep_fold(view, fit_idx, val_idx, test_idx, weight, seed)
@@ -256,6 +263,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data", default=None, help="真实数据表 meta.csv 的路径；不填则用模拟数据")
     parser.add_argument("--decision-day", type=int, default=DECISION_DAY, help="看哪个孵化日的结果")
     parser.add_argument("--allow-no-batch", action="store_true", help="允许数据没有批次信息（结果不能当作对新批次的性能）")
+    parser.add_argument("--allow-ungrouped-val", action="store_true",
+                        help="真实数据批次太少、早停验证没法按批次分时，允许按蛋随机分（早停结果不能当作对新批次的泛化）")
     args = parser.parse_args()
     # split_holdout / load_data 还会读这几项：消融不做标签打乱，也不新指定测试批次
     args.shuffle_labels, args.fertility_check, args.holdout_batches = False, False, None
@@ -277,7 +286,7 @@ def main() -> int:
     data, hold = split_holdout(data_all, args)      # 测试批次只是被排除在外，下面不会读它
     log.info("消融只用开发集做交叉验证：" + ("独立测试集不参加、不评估，查看次数不变" if hold is not None else "这份数据没有留独立测试集"))
     plans = plan_folds(data, N_FOLDS, SEED)
-    isolation = audit(data, hold, plans)       # 没通过就抛 IsolationError，什么都不训练
+    isolation = audit(data, hold, plans, strict_val(args))      # 没通过就抛 IsolationError，什么都不训练
     log.info("数据隔离检查通过")
     for note in isolation["提醒"]:
         log.warning(f"  提醒：{note}")

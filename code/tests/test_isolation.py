@@ -3,6 +3,7 @@
 - 基线：SNV 对每条光谱单独缩放，放大数会被它抹平，所以改按"身份"核对——测试蛋 SNV 之后的每一条光谱，
   都不能原样出现在任何一次基线拟合的输入里。
 用两种人为制造的泄漏核对过这些检查确实会失败（见 TestChecksCatchLeaks）。"""
+import argparse
 import logging
 import sys
 import unittest
@@ -142,11 +143,27 @@ class TestAudit(unittest.TestCase):
         dev = replace(self.dev, egg_ids=(self.dev.egg_ids[1], *self.dev.egg_ids[1:]))
         self.assertFails("蛋编号重复", dev=dev)
 
-    def test_ungrouped_validation_is_a_note_not_an_error(self) -> None:
+    def test_ungrouped_validation_is_a_note_in_demo_mode(self) -> None:
         p = self.plans[0]
         loose = FoldPlan(p.train, p.test, p.fit, p.val, False)
         rec = audit(self.dev, None, [loose, *self.plans[1:]])
         self.assertTrue(any("按蛋随机" in n for n in rec["提醒"]))
+
+    def test_ungrouped_validation_is_an_error_in_formal_mode(self) -> None:
+        """正式模式：早停验证没能按批次分就停下，不再悄悄换成按蛋随机分。"""
+        p = self.plans[0]
+        loose = FoldPlan(p.train, p.test, p.fit, p.val, False)
+        with self.assertRaises(IsolationError) as caught:
+            audit(self.dev, None, [loose, *self.plans[1:]], strict_val=True)
+        self.assertIn("--allow-ungrouped-val", str(caught.exception))
+        audit(self.dev, None, self.plans, strict_val=True)                     # 都按批次分的照常通过
+
+    def test_strict_only_for_real_data_without_override(self) -> None:
+        ns = lambda **k: argparse.Namespace(**{"data": None, "fertility_check": False, **k})  # noqa: E731
+        self.assertFalse(train_demo.strict_val(ns()))
+        self.assertTrue(train_demo.strict_val(ns(data="meta.csv")))
+        self.assertTrue(train_demo.strict_val(ns(fertility_check=True)))
+        self.assertFalse(train_demo.strict_val(ns(data="meta.csv", allow_ungrouped_val=True)))
 
     def test_no_batch_info_note(self) -> None:
         solo = replace(self.dev, batch=np.array(self.dev.egg_ids, dtype=object))

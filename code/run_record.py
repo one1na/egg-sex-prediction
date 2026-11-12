@@ -63,20 +63,27 @@ def environment() -> dict[str, str]:
     return {"python": sys.version.split()[0], "系统": platform.platform(),
             "numpy": numpy.__version__, "scipy": scipy.__version__,
             "scikit-learn": sklearn.__version__, "torch": torch.__version__,
-            "torch线程数": str(torch.get_num_threads()),
+            "torch线程数": str(torch.get_num_threads()), "CPU": platform.processor() or platform.machine(),
+            "CPU核数": str(os.cpu_count()),
             "GPU": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "无（只用 CPU）"}
 
 
 # ---------- 复现 ----------
-def set_determinism(seed: int) -> None:
-    """固定所有随机源，并让 PyTorch 尽量只用结果确定的算法（没有确定性实现的算子只警告、不报错）。
-    同一台机器、同样版本时结果应该逐位相同；换 CPU 型号、线程数或 GPU，浮点累加顺序可能不同，结果会有极小差别。"""
+DETERMINISM_WARN = "已固定随机种子，PyTorch 只用确定性算法（没有确定性实现的算子只警告）"
+DETERMINISM_STRICT = "严格模式：已固定随机种子，PyTorch 只用确定性算法，遇到没有确定性实现的算子直接报错停下"
+
+
+def set_determinism(seed: int, strict: bool = False) -> None:
+    """固定所有随机源，并让 PyTorch 只用结果确定的算法。默认没有确定性实现的算子只警告、不报错；
+    strict=True（--strict-determinism，正式复现实验用）时直接报错停下，保证结果不受这类算子影响。
+    同一台机器、同样版本时结果应该逐位相同；换 CPU 型号、线程数或 GPU，浮点累加顺序可能不同，结果会有极小差别，
+    所以"环境"一项记下了 CPU、线程数和 GPU。"""
     import torch
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")     # GPU 上矩阵乘法确定性需要的设置
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.use_deterministic_algorithms(True, warn_only=not strict)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
 
@@ -183,10 +190,10 @@ def dependency_check(path: Path = REQUIREMENTS) -> dict:
     return {"一致": not mismatches, "不一致": mismatches}
 
 
-def reproducibility(run_dir: Path, data: object = None, csv_path: str | None = None) -> dict:
-    """写进 config.json 的"复现"一项。"""
+def reproducibility(run_dir: Path, data: object = None, csv_path: str | None = None, strict: bool = False) -> dict:
+    """写进 config.json 的"复现"一项。strict 和 set_determinism 的一致。"""
     info = {"命令": [Path(sys.argv[0]).name, *sys.argv[1:]], "代码版本": code_version(run_dir),
-            "依赖版本": dependency_check(), "确定性": "已固定随机种子，PyTorch 只用确定性算法（没有的只警告）"}
+            "依赖版本": dependency_check(), "确定性": DETERMINISM_STRICT if strict else DETERMINISM_WARN}
     if data is not None:
         info["数据指纹"] = data_fingerprint(data, csv_path)
     return info
