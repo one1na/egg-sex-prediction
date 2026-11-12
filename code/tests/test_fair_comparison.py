@@ -13,6 +13,7 @@ logging.disable(logging.WARNING)
 
 import report  # noqa: E402
 import train_demo  # noqa: E402
+from isolation import FoldPlan  # noqa: E402
 from baselines import BASELINE_NAMES, MATCHED_NAMES, matched_name  # noqa: E402
 from evaluation import (MIN_BATCHES_FOR_INTERVAL, Paired, ScopeStats, batch_utilities, group_interval,  # noqa: E402
                         inner_split)
@@ -121,7 +122,7 @@ class TestMatchedBaseline(unittest.TestCase):
         with mock.patch.object(train_demo.dt, "train_early_stop", return_value=mock.Mock(epochs=3)), \
                 mock.patch.object(train_demo.dt, "predict_scores", return_value=deep), \
                 mock.patch.object(train_demo, "per_day_baselines", side_effect=fake_baselines):
-            scores, _, epochs, n_fit = train_demo.run_fold(data, train_idx, test_idx, 0.0, 7)
+            scores, _, epochs, n_fit = train_demo.run_fold(data, FoldPlan(train_idx, test_idx, fit_idx, val_idx, True), 0.0, 7)
         self.assertEqual((epochs, n_fit), (3, len(fit_idx)))
         self.assertLess(len(fit_idx), len(train_idx))
         np.testing.assert_array_equal(calls[0], train_idx)                     # 正式比较：全部训练蛋

@@ -35,7 +35,8 @@ from controls import run_controls
 from deep_train import PRIMARY_DEEP
 from evaluation import (CHANCE_PASS, CHANCE_UNKNOWN, MIN_HOLDOUT_BATCHES, PRIMARY_METRIC, WILSON_LABEL, batch_utilities,
                         common_accuracy, compare_paired,
-                        fold_day_metrics, holdout_split, inner_split, outer_folds, pooled_utility)
+                        fold_day_metrics, holdout_split, pooled_utility)
+from isolation import FoldPlan, IsolationError, audit, plan_folds
 from preprocess_binding import preprocess_settings
 from real_data import eggs_without_batch, load_real_dataset
 from run_record import (EXIT_HOLDOUT_USED, EXIT_SELF_CHECK_FAILED, attach_log, environment, new_run_dir,
@@ -249,13 +250,13 @@ def log_overview(data: EggDataset, args: argparse.Namespace, dev_weight: float) 
 
 
 # ---------- 交叉验证 ----------
-def run_fold(data: EggDataset, train_idx: np.ndarray, test_idx: np.ndarray, dev_weight: float,
+def run_fold(data: EggDataset, plan: FoldPlan, dev_weight: float,
              seed: int) -> tuple[dict[str, np.ndarray], np.ndarray, int, int]:
     """一折：深度模型和基线在同一批测试蛋上打分。深度模型从训练部分里再分出早停验证，只用剩下的拟合；
     基线训练两遍：用这一折的全部训练蛋（正式比较，和部署时一致），以及只用深度模型拟合的那部分（同样本量对照）。
     返回 (各方法分数, 发育预测, 深度模型最好轮数, 拟合用的蛋数)。"""
     start = time.time()
-    fit_idx, val_idx, grouped = inner_split(train_idx, data.sex, data.batch, seed)
+    train_idx, test_idx, fit_idx, val_idx, grouped = plan.train, plan.test, plan.fit, plan.val, plan.grouped
     trained = dt.train_early_stop(data, fit_idx, val_idx, dev_weight, seed)
     deep = dt.predict_scores(trained, data.x[test_idx], data.mask[test_idx], data.days)
     base = per_day_baselines(data.spec, data.mask, data.sex, train_idx, test_idx)
@@ -267,17 +268,19 @@ def run_fold(data: EggDataset, train_idx: np.ndarray, test_idx: np.ndarray, dev_
     return scores, deep["dev"], trained.epochs, len(fit_idx)
 
 
-def cross_validate(data: EggDataset, dev_weight: float) -> CVResult:
-    folds = outer_folds(data.sex, data.batch, N_FOLDS, SEED)
+def cross_validate(data: EggDataset, dev_weight: float, plans: list[FoldPlan]) -> CVResult:
+    """plans 来自 isolation.plan_folds，训练前已经过隔离检查。"""
+    folds = [(p.train, p.test) for p in plans]
     log.info(f"\n开发集 {len(data.sex)} 颗蛋，按批次分组做 {len(folds)} 折交叉验证")
     n_eggs, n_days = data.mask.shape
     scores = {name: np.full((n_eggs, n_days), np.nan) for name in (*DEEP_NAMES, *BASELINE_NAMES, *MATCHED_NAMES)}
     dev_pred = np.full((n_eggs, n_days), np.nan)
     fold_of_egg = np.full(n_eggs, -1)
     epochs, n_fit = [], []
-    for k, (train_idx, test_idx) in enumerate(folds):
+    for k, plan in enumerate(plans):
+        train_idx, test_idx = plan.train, plan.test
         log.info(f"第 {k + 1}/{len(folds)} 折")
-        fold_scores, fold_dev, best_epoch, fit_size = run_fold(data, train_idx, test_idx, dev_weight, SEED + k)
+        fold_scores, fold_dev, best_epoch, fit_size = run_fold(data, plan, dev_weight, SEED + k)
         for name, s in fold_scores.items():
             scores[name][test_idx] = s
         dev_pred[test_idx] = fold_dev
@@ -526,10 +529,22 @@ def main() -> int:
                                                 "复现": repro})
             return EXIT_HOLDOUT_USED
 
-    cv = cross_validate(data, dev_weight)
+    plans = plan_folds(data, N_FOLDS, SEED)
+    try:
+        isolation = audit(data, hold, plans)
+    except IsolationError as e:
+        log.error(f"\n!!! {e}")
+        save_json(run_dir / "config.json", {"时间": datetime.now().isoformat(timespec="seconds"),
+                                            "数据": args.data or "模拟数据", "隔离检查": str(e), "复现": repro})
+        raise
+    log.info(f"数据隔离检查通过：独立测试集、{len(plans)} 折交叉验证、每折的早停验证之间没有共同的蛋或批次")
+    for note in isolation["提醒"]:
+        log.warning(f"  提醒：{note}")
+    cv = cross_validate(data, dev_weight, plans)
     metrics = evaluate(data, cv, run_dir)
     config = run_config(args, data, dev_weight, cv)
     config["复现"] = repro
+    config["隔离检查"] = isolation
     if args.shuffle_labels:
         config["自检"] = check_record(self_check(data, cv, metrics, args))
     else:

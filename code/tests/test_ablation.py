@@ -200,7 +200,7 @@ class TestEndToEnd(unittest.TestCase):
     def test_holdout_is_excluded_and_never_viewed(self) -> None:
         seen = []
         real = ablation.run_ablation
-        with mock.patch.object(ablation, "run_ablation", side_effect=lambda d, w, v: seen.append(d) or real(d, w, v)):
+        with mock.patch.object(ablation, "run_ablation", side_effect=lambda d, *rest: seen.append(d) or real(d, *rest)):
             ablation.main()
         record = holdout_lock.read_split(self.lock)
         self.assertTrue(record.holdout_batches)

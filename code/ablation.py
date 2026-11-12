@@ -29,7 +29,8 @@ import numpy as np
 import deep_train as dt
 from baselines import per_day_baselines
 from evaluation import (ALPHA, PRIMARY_METRIC, Paired, batch_utilities, compare_paired, fold_day_metrics,
-                        group_interval, inner_split, outer_folds)
+                        group_interval)
+from isolation import FoldPlan, audit, plan_folds
 from run_record import attach_log, environment, new_run_dir, reproducibility, save_csv, save_json, set_determinism
 from synth_data import EggDataset
 from train_demo import DECISION_DAY, N_FOLDS, SEED, check_batches, decision_index, load_data, split_holdout
@@ -132,18 +133,20 @@ def _deep_fold(data: EggDataset, fit_idx: np.ndarray, val_idx: np.ndarray, test_
     return dt.predict_scores(trained, data.x[test_idx], data.mask[test_idx], data.days)
 
 
-def run_ablation(data: EggDataset, dev_weight: float, variants: tuple[Variant, ...]) -> AblationResult:
-    """所有变体共用同一套外层分折、早停验证划分和随机种子（和正式训练的完全一样）。"""
-    folds = outer_folds(data.sex, data.batch, N_FOLDS, SEED)
+def run_ablation(data: EggDataset, dev_weight: float, variants: tuple[Variant, ...],
+                 plans: list[FoldPlan] | None = None) -> AblationResult:
+    """所有变体共用同一套外层分折、早停验证划分和随机种子（和正式训练的完全一样，都来自 isolation.plan_folds）。"""
+    plans = plan_folds(data, N_FOLDS, SEED) if plans is None else plans
+    folds = [(p.train, p.test) for p in plans]
     n_eggs, n_days = data.mask.shape
     scores = {v.name: np.full((n_eggs, n_days), np.nan) for v in variants}
     fold_of_egg = np.full(n_eggs, -1)
     views = {v.name: (data if v.transform is None else v.transform(data)) for v in variants}
     log.info(f"\n开发集 {n_eggs} 颗蛋，{len(folds)} 折交叉验证 × {len(variants)} 个变体")
-    for k, (train_idx, test_idx) in enumerate(folds):
+    for k, plan in enumerate(plans):
         start = time.time()
         seed = SEED + k
-        fit_idx, val_idx, _ = inner_split(train_idx, data.sex, data.batch, seed)
+        train_idx, test_idx, fit_idx, val_idx = plan.train, plan.test, plan.fit, plan.val
         fold_of_egg[test_idx] = k
         full = None
         for v in variants:
@@ -273,10 +276,15 @@ def main() -> int:
     dev_weight = dt.DEV_LOSS_WEIGHT if data_all.dev_mask.any() else 0.0
     data, hold = split_holdout(data_all, args)      # 测试批次只是被排除在外，下面不会读它
     log.info("消融只用开发集做交叉验证：" + ("独立测试集不参加、不评估，查看次数不变" if hold is not None else "这份数据没有留独立测试集"))
+    plans = plan_folds(data, N_FOLDS, SEED)
+    isolation = audit(data, hold, plans)       # 没通过就抛 IsolationError，什么都不训练
+    log.info("数据隔离检查通过")
+    for note in isolation["提醒"]:
+        log.warning(f"  提醒：{note}")
     del hold
 
     variants = build_variants(data, dev_weight)
-    res = run_ablation(data, dev_weight, variants)
+    res = run_ablation(data, dev_weight, variants, plans)
     rows, days = summarize(data, res, day_idx), per_day_rows(data, res)
     log_summary(rows, args.decision_day, n_comparisons(variants))
     log_per_day(days)
@@ -293,7 +301,7 @@ def main() -> int:
         "比较项数": n_comparisons(variants), "显著性水平": ALPHA,
         "校正后门槛": ALPHA / max(1, n_comparisons(variants)),
         "变体": [{"名字": v.name, "回答的问题": v.question} for v in variants], "环境": environment(),
-        "复现": repro})
+        "复现": repro, "隔离检查": isolation})
     log.info(f"\n这次消融的全部记录在：{run_dir}")
     return 0
 
