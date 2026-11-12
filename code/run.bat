@@ -32,7 +32,7 @@ if errorlevel 3 (
 )
 if errorlevel 2 (
     echo.
-    echo [Self-check FAILED] Possible information leak, or cannot be confirmed. See the log and output\runs\*\config.json. Do not use this run's results. No model was saved.
+    echo [Self-check FAILED] Possible information leak, cannot be confirmed, or (real data) no matching --shuffle-labels self-check was run first. See the log and output\runs\*\config.json. Do not use this run's results. No model was saved.
 )
 
 :end

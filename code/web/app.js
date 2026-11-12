@@ -385,7 +385,7 @@ function buildTiles(config) {
       result["深度模型明显更好"] ? "深度模型明显好过基线" : "深度模型没有明显好过基线", true));
   }
   tiles.push(tile(`深度模型（第 ${config["决策日"]} 天）`, fmt(result["深度模型决策效用"]), "交叉验证决策效用"));
-  tiles.push(tile(`最好的基线 ${result["最好的基线"] || ""}`, fmt(result["基线决策效用"]), "交叉验证决策效用"));
+  tiles.push(tile(`基线 ${result["主比较基线"] || result["最好的基线"] || ""}`, fmt(result["基线决策效用"]), "交叉验证决策效用"));
   const interval = result["差值95%区间"];
   tiles.push(tile("深度减基线", signed(result["差值"]),
     `单侧 p = ${fmt(result["单侧p"])}${interval ? `，95% 区间 ${signed(interval[0])} 到 ${signed(interval[1])}` : ""}`));

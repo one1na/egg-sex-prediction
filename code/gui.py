@@ -33,8 +33,9 @@ def failure_message(name: str, code: int) -> str | None:
     if code == 0:
         return None
     if code == EXIT_SELF_CHECK_FAILED:
-        return (f"{SELF_CHECK_MARK} 流程可能有信息泄漏，或统计量算不出来无法确认，详见日志和 output/runs/ 里最新一次"
-                "运行的 config.json；这次的结果不能用，也没有保存新模型（之前的模型原样保留）\n")
+        return (f"{SELF_CHECK_MARK} 流程可能有信息泄漏，或统计量算不出来无法确认；真实数据还可能是没先做对应的流程自检。"
+                "详见日志和 output/runs/ 里最新一次运行的 config.json（“发布检查”一项）；"
+                "这次的结果不能用，也没有保存新模型（之前的模型原样保留）\n")
     if code == EXIT_HOLDOUT_USED:
         return (f"{HOLDOUT_MARK} 独立测试集已经看过，不能再做正式评估，这次没有训练。只想重新训练就勾选"
                 "“只重新训练，不看独立测试集”；其他办法见上面的说明\n")

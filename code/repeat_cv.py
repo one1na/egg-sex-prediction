@@ -8,7 +8,7 @@
 规矩：
 - 只在开发集上做，独立测试集完全不碰、查看次数不变，不保存任何模型；每一遍都先过数据隔离检查。
 - 第 1 遍用正式训练的分折（种子和正式训练相同），结果应该和正式训练的交叉验证一致；之后每遍换一个种子。
-- 每遍都按正式规则走一次：挑决策效用最高的基线，深度模型 vs 它做配对检验。
+- 每遍都按正式规则走一次：深度模型 vs 事先指定的主比较基线（baselines.PRIMARY_BASELINE）做配对检验。
 - 各遍之间共用同一批蛋，并不独立：各遍结果的离散程度说明"换个分法会差多少"，不是置信区间；
   也不能挑最好的一遍报告——正式结果仍然是第 1 遍（即正式训练）的。
 """
@@ -21,7 +21,7 @@ import numpy as np
 
 import deep_train as dt
 import report
-from baselines import BASELINE_NAMES
+from baselines import PRIMARY_BASELINE
 from deep_train import PRIMARY_DEEP
 from evaluation import ALPHA, PRIMARY_METRIC, compare_paired, fold_day_metrics
 from isolation import audit, plan_folds
@@ -43,12 +43,12 @@ def one_repeat(data, dev_weight: float, day_idx: int, seed: int) -> dict:
     audit(data, None, plans)
     cv = cross_validate(data, dev_weight, plans)
     utility = {name: fold_day_metrics(s, data.sex, cv.fold_of_egg, cv.n_folds)[PRIMARY_METRIC][:, day_idx]
-               for name, s in cv.scores.items() if name in (PRIMARY_DEEP, *BASELINE_NAMES)}
-    best = max(BASELINE_NAMES, key=lambda n: np.nan_to_num(report.nanmean(utility[n]), nan=-1.0))
+               for name, s in cv.scores.items() if name in (PRIMARY_DEEP, PRIMARY_BASELINE)}
+    best = PRIMARY_BASELINE
     cmp = compare_paired(utility[PRIMARY_DEEP], utility[best], cv.n_train, cv.n_test)
     better = bool(cmp.p < ALPHA)                    # 和正式训练同一条规则（p 算不出来按"没有明显好过"）
     return {"分折种子": seed, "折数": cv.n_folds, "深度决策效用": report.num_or_none(report.nanmean(utility[PRIMARY_DEEP])),
-            "最好的基线": best, "基线决策效用": report.num_or_none(report.nanmean(utility[best])),
+            "主比较基线": best, "基线决策效用": report.num_or_none(report.nanmean(utility[best])),
             "差值": report.num_or_none(cmp.diff), "单侧p": report.num_or_none(cmp.p), "深度明显更好": better,
             "按规则部署": PRIMARY_DEEP if better else best}
 
@@ -67,7 +67,6 @@ def summarize(rows: list[dict]) -> dict:
     return {"遍数": len(rows), "深度决策效用": spread([r["深度决策效用"] for r in rows]),
             "基线决策效用": spread([r["基线决策效用"] for r in rows]), "差值": spread([r["差值"] for r in rows]),
             "深度明显更好的遍数": sum(r["深度明显更好"] for r in rows),
-            "最好的基线是否每遍相同": len({r["最好的基线"] for r in rows}) == 1,
             "部署决定是否每遍相同": len(set(decisions)) == 1,
             "正式结果": "第 1 遍（和正式训练同样的分折）"}
 
@@ -108,7 +107,7 @@ def main() -> int:
         log.info(f"\n===== 第 {r + 1}/{args.repeats} 遍（分折种子 {seed}{'，和正式训练相同' if r == 0 else ''}）=====")
         rows.append({"遍": r + 1, **one_repeat(data, dev_weight, day_idx, seed)})
         x = rows[-1]
-        log.info(f"第 {r + 1} 遍：深度 {x['深度决策效用']}，最好的基线 {x['最好的基线']} {x['基线决策效用']}，"
+        log.info(f"第 {r + 1} 遍：深度 {x['深度决策效用']}，基线 {x['主比较基线']} {x['基线决策效用']}，"
                  f"差值 {x['差值']}，p {x['单侧p']}，按规则部署 {x['按规则部署']}")
     summary = summarize(rows)
     log.info(f"\n决策日（第 {args.decision_day} 天）{args.repeats} 遍汇总：")

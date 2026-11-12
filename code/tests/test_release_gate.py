@@ -3,10 +3,13 @@
 这里是不训练模型的快速测试；整条链上的同类检查在 test_e2e.py。
 """
 import argparse
+import json
 import logging
+import os
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -20,6 +23,7 @@ import gui  # noqa: E402
 import holdout_lock  # noqa: E402
 import real_data  # noqa: E402
 import report  # noqa: E402
+import run_record  # noqa: E402
 import train_demo  # noqa: E402
 from evaluation import ScopeStats  # noqa: E402
 from run_record import EXIT_HOLDOUT_USED, EXIT_SELF_CHECK_FAILED  # noqa: E402
@@ -43,17 +47,27 @@ def background(status: str) -> dict:
 
 
 NO_CONTROLS = {"批次可分性": None, "背景对照": None}
+DEMO = argparse.Namespace(data=None, fertility_check=False)
+FORMAL = argparse.Namespace(data="meta.csv", fertility_check=False)
+REPRO = {"代码版本": {"代码指纹": "code1"}, "数据指纹": {"整体": "data1"}}
+
+
+def gate(args: argparse.Namespace, statuses: dict | None, controls: dict, data: EggDataset | None = None,
+         repro: dict | None = None) -> dict:
+    return train_demo.gate_checks(args, data or stub(2), statuses, controls, repro)
+
+
+def blockers(*a, **k) -> list[str]:
+    return train_demo.release_blockers(gate(*a, **k))
 
 
 class TestReleaseBlockers(unittest.TestCase):
-    def test_nothing_checked_or_all_passed_releases(self) -> None:
-        self.assertEqual(train_demo.release_blockers(None, NO_CONTROLS), [])
-        check = train_demo.check_record({"a": PASS, "b": PASS})
-        self.assertEqual(train_demo.release_blockers(check, background(PASS)), [])
+    def test_all_passed_releases(self) -> None:
+        self.assertEqual(blockers(DEMO, {"a": PASS, "b": PASS}, background(PASS)), [])
 
     def test_failed_self_check_blocks(self) -> None:
         for status in (ALARM, UNKNOWN):
-            reasons = train_demo.release_blockers(train_demo.check_record({"a": PASS, "b": status}), NO_CONTROLS)
+            reasons = blockers(DEMO, {"a": PASS, "b": status}, NO_CONTROLS)
             self.assertEqual(len(reasons), 1)
             self.assertIn("流程自检未通过", reasons[0])
             self.assertIn(f"b：{status}", reasons[0])
@@ -61,13 +75,81 @@ class TestReleaseBlockers(unittest.TestCase):
 
     def test_failed_background_control_blocks_even_if_self_check_passed(self) -> None:
         for status in (ALARM, UNKNOWN):
-            reasons = train_demo.release_blockers(train_demo.check_record({"a": PASS}), background(status))
+            reasons = blockers(DEMO, {"a": PASS}, background(status))
             self.assertEqual(len(reasons), 1)
             self.assertIn("背景负对照", reasons[0])
 
     def test_both_failures_are_both_reported(self) -> None:
-        reasons = train_demo.release_blockers(train_demo.check_record({"a": ALARM}), background(ALARM))
-        self.assertEqual(len(reasons), 2)
+        self.assertEqual(len(blockers(DEMO, {"a": ALARM}, background(ALARM))), 2)
+
+    def test_four_states(self) -> None:
+        with_bg = train_demo.replace(stub(2), bg_spec=np.zeros((8, 1, 1), dtype=np.float32))
+        g = gate(DEMO, None, NO_CONTROLS)
+        self.assertEqual((g["模式"], g["流程自检"]["状态"], g["背景负对照"]["状态"]), ("演示", "未执行", "不适用"))
+        self.assertEqual(gate(DEMO, None, NO_CONTROLS, data=with_bg)["背景负对照"]["状态"], "未执行")
+        self.assertEqual(gate(DEMO, {"a": ALARM}, background(PASS))["流程自检"]["状态"], "未通过")
+
+    def test_not_run_only_warns_in_demo_mode(self) -> None:
+        self.assertEqual(blockers(DEMO, None, NO_CONTROLS), [])
+
+    def test_not_run_blocks_in_formal_mode(self) -> None:
+        """真实数据：没做打乱标签自检就不发布——"没有检查"不能当作"通过检查"。"""
+        with mock.patch.object(train_demo, "find_self_check", return_value=None):
+            reasons = blockers(FORMAL, None, background(PASS), repro=REPRO)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("流程自检未执行", reasons[0])
+        self.assertIn("--shuffle-labels", reasons[0])
+        for fertility in (True, False):
+            mode = train_demo.gate_mode(argparse.Namespace(data=None, fertility_check=fertility))
+            self.assertEqual(mode, "正式" if fertility else "演示")
+
+    def test_background_not_run_blocks_in_formal_mode_but_not_applicable_does_not(self) -> None:
+        with_bg = train_demo.replace(stub(2), bg_spec=np.zeros((8, 1, 1), dtype=np.float32))
+        found = {"运行": "r1", "总体": PASS}
+        with mock.patch.object(train_demo, "find_self_check", return_value=found):
+            self.assertEqual(blockers(FORMAL, None, NO_CONTROLS, repro=REPRO), [])                 # 没有背景光谱
+            reasons = blockers(FORMAL, None, NO_CONTROLS, data=with_bg, repro=REPRO)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("背景负对照未执行", reasons[0])
+
+
+class TestFindSelfCheck(unittest.TestCase):
+    """正式模式的发布条件：以前跑过一次打乱标签的自检，代码指纹和打乱前的数据指纹都和这次一样。"""
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp())
+        self.patch = mock.patch.object(run_record, "RUNS_DIR", self.dir)
+        self.patch.start()
+
+    def tearDown(self) -> None:
+        self.patch.stop()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def add(self, name: str, overall: str, code: str = "code1", data: str = "data1", shuffled: bool = True) -> None:
+        (self.dir / name).mkdir()
+        config = {"流程自检（打乱标签）": shuffled, "自检": {"总体": overall},
+                  "复现": {"代码版本": {"代码指纹": code}, "数据指纹": {"整体": "shuffled"}, "打乱前数据指纹": {"整体": data}}}
+        (self.dir / name / "config.json").write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+
+    def test_matching_run_found_latest_wins(self) -> None:
+        self.assertIsNone(train_demo.find_self_check(REPRO))
+        self.add("2026-01-01_100000_流程自检", "未通过")
+        self.add("2026-01-02_100000_流程自检", PASS)
+        self.assertEqual(train_demo.find_self_check(REPRO), {"运行": "2026-01-02_100000_流程自检", "总体": PASS})
+        self.add("2026-01-03_100000_流程自检", "未通过")
+        found = train_demo.find_self_check(REPRO)
+        self.assertEqual(found["总体"], "未通过")
+        g = gate(FORMAL, None, NO_CONTROLS, repro=REPRO)
+        self.assertEqual(g["流程自检"]["状态"], "未通过")
+
+    def test_other_code_data_or_normal_runs_do_not_count(self) -> None:
+        self.add("2026-01-01_100000_流程自检", PASS, code="old")
+        self.add("2026-01-02_100000_流程自检", PASS, data="other")
+        self.add("2026-01-03_100000_真实数据", PASS, shuffled=False)
+        (self.dir / "2026-01-04_100000_坏的").mkdir()
+        (self.dir / "2026-01-04_100000_坏的" / "config.json").write_text("{", encoding="utf-8")
+        self.assertIsNone(train_demo.find_self_check(REPRO))
+        self.assertIsNone(train_demo.find_self_check(None))
 
 
 class TestFinishGate(unittest.TestCase):
@@ -78,13 +160,14 @@ class TestFinishGate(unittest.TestCase):
         self.data, self.hold = stub(4), stub(2)
         self.cv = mock.Mock(fold_of_egg=np.zeros(len(self.data.sex), dtype=int), n_train=8.0, n_test=8.0,
                             best_epochs=(1, 1), dev_pred=np.zeros((len(self.data.sex), 1)))
-        self.args = argparse.Namespace(data=None, decision_day=0, debug_holdout=False, fertility_check=False)
+        self.args = argparse.Namespace(data=None, decision_day=0, debug_holdout=False, fertility_check=False,
+                                       shuffle_labels=False)
 
     def tearDown(self) -> None:
         shutil.rmtree(self.dir, ignore_errors=True)
 
     def finish(self, statuses: dict | None, controls: dict) -> tuple[dict, mock.Mock, mock.Mock, mock.Mock]:
-        decision = {"深度模型明显更好": False, "最好的基线": "PLS-DA"}
+        decision = {"深度模型明显更好": False, "主比较基线": "PLS-DA"}
         holdout_extra = {"holdout_views": 1}
         with mock.patch.object(train_demo, "decide", return_value=decision), \
                 mock.patch.object(train_demo.report, "log_dev", return_value=[]), \
@@ -115,6 +198,11 @@ class TestFinishGate(unittest.TestCase):
         self.assert_blocked(None, background(ALARM), "背景负对照")
         self.assert_blocked({"a": PASS}, background(UNKNOWN), "背景负对照")
 
+    def test_formal_mode_without_self_check_stops_before_final_model(self) -> None:
+        self.args.data = str(self.dir / "meta.csv")
+        with mock.patch.object(run_record, "RUNS_DIR", self.dir / "runs"):
+            self.assert_blocked(None, background(PASS), "流程自检未执行")
+
     def test_passing_checks_train_evaluate_and_save(self) -> None:
         extra, train_final, run_holdout, save = self.finish({"a": PASS}, background(PASS))
         train_final.assert_called_once()
@@ -122,6 +210,7 @@ class TestFinishGate(unittest.TestCase):
         save.assert_called_once()
         self.assertEqual(extra["模型发布"], {"已发布": True, "未发布原因": []})
         self.assertEqual(extra["holdout_views"], 1)
+        self.assertEqual(extra["发布检查"]["流程自检"]["状态"], "通过")
 
 
 class TestHoldoutOnlyOnce(unittest.TestCase):
@@ -170,6 +259,52 @@ class TestHoldoutOnlyOnce(unittest.TestCase):
         with self.assertRaises(train_demo.HoldoutUsedError):
             self.view()
         self.assertEqual(self.views(), 1)                                   # 被拦下的不算查看
+
+    def test_interrupted_evaluation_counts_as_viewed(self) -> None:
+        """先记后看：算成绩时程序崩了，这次也按看过算，下次正式评估被拦下。"""
+        with mock.patch.object(train_demo.deploy, "evaluate_holdout", side_effect=RuntimeError("断电")), \
+                self.assertRaises(RuntimeError):
+            train_demo.run_holdout(None, self.hold, self.args(), 0, "x", self.dir)
+        key = holdout_lock.view_key(self.hold.batch)
+        self.assertEqual((self.views(), holdout_lock.unfinished_views(self.lock, key)), (1, 1))
+        with self.assertRaises(train_demo.HoldoutUsedError) as caught:
+            train_demo.guard_holdout(self.hold, self.args())
+        self.assertIn("中途中断", str(caught.exception))
+        self.assertTrue(holdout_lock.read_split(self.lock) is None or holdout_lock.read_split(self.lock).holdout_viewed)
+
+    def test_finished_evaluation_is_marked_done_with_result(self) -> None:
+        self.view()
+        (entry,) = holdout_lock._load(self.lock)[0][holdout_lock.view_key(self.hold.batch)]["evaluations"]
+        self.assertEqual((entry["状态"], entry["成绩"]["蛋数"]), ("完成", len(self.hold.sex)))
+
+    def test_concurrent_runs_get_only_one_formal_view(self) -> None:
+        """两个（这里是八个）训练同时跑到独立测试集：只有一个拿得到正式查看，其余被拦下。"""
+        key = holdout_lock.view_key(self.hold.batch)
+        start, results = threading.Barrier(8), []
+
+        def claim(i: int) -> None:
+            start.wait()
+            try:
+                results.append(holdout_lock.begin_view(self.lock, key, f"run{i}", "x", 8, "h"))
+            except holdout_lock.AlreadyViewed:
+                results.append("blocked")
+
+        threads = [threading.Thread(target=claim, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sorted(results, key=str), [0] + ["blocked"] * 7)
+        self.assertEqual(self.views(), 1)
+        self.assertFalse(list(self.dir.glob("*.busy")) + list(self.dir.glob("*.tmp")))
+
+    def test_stale_busy_marker_is_cleared(self) -> None:
+        busy = self.lock.with_name(self.lock.name + ".busy")
+        busy.write_text("12345")
+        old = busy.stat().st_mtime - holdout_lock.BUSY_STALE - 10
+        os.utime(busy, (old, old))
+        holdout_lock.record_view(self.lock, "k", "run1", "x", {})
+        self.assertFalse(busy.exists())
 
     def test_skip_holdout_returns_no_holdout_and_does_not_count(self) -> None:
         self.view()

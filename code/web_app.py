@@ -93,8 +93,9 @@ def build_command(action: str, params: dict) -> tuple[str, list[str]]:
 
 OUTCOMES = {
     0: ("ok", "完成"),
-    EXIT_SELF_CHECK_FAILED: ("self_check_failed", "自检未通过：流程可能有信息泄漏，或统计量算不出来无法确认。这次的结果不能用，"
-                                                  "也没有保存新模型（之前的模型原样保留）。详见日志和这次运行的记录。"),
+    EXIT_SELF_CHECK_FAILED: ("self_check_failed", "自检未通过：流程可能有信息泄漏，或统计量算不出来无法确认；真实数据还可能是"
+                                                  "没先做对应的流程自检。这次的结果不能用，也没有保存新模型"
+                                                  "（之前的模型原样保留）。详见日志和这次运行的记录。"),
     EXIT_HOLDOUT_USED: ("holdout_blocked", "已拦截：独立测试集已经看过，不能再做正式评估，这次没有训练。只想重新训练就勾选"
                                            "“只重新训练，不看独立测试集”；其他办法见日志里的说明。"),
 }
@@ -249,7 +250,7 @@ def run_summary(run_dir: Path) -> dict:
     return {"name": run_dir.name, "kind": _kind(run_dir.name), "time": config.get("时间"),
             "status": category, "status_text": text, "chosen": config.get("部署方法"),
             "decision_day": config.get("决策日"), "deep_utility": result.get("深度模型决策效用"),
-            "base_utility": result.get("基线决策效用"), "base_name": result.get("最好的基线"),
+            "base_utility": result.get("基线决策效用"), "base_name": result.get("主比较基线") or result.get("最好的基线"),
             "not_sex": "标签含义" in config}
 
 

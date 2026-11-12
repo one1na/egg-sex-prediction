@@ -8,7 +8,9 @@
 流程自检：双击 4-流程自检.bat，或加 --shuffle-labels。性别标签随机打乱后整套跑一遍，
           准确率应该都在 0.5 左右；明显偏高说明测试数据的信息漏进了训练。自检不保存模型，没通过时退出码非 0。
 模型发布门控：正常训练时自检或背景负对照没通过，就不训练最终模型、不看独立测试集、不写模型文件（退出码 2），
-          output 里上一次通过检查的模型原样保留。
+          output 里上一次通过检查的模型原样保留。每项检查分"通过 / 未通过 / 未执行 / 不适用"：
+          真实数据（含真实光谱检验）是正式模式，没做的检查不当作通过——必须先跑一次打乱标签的流程自检，
+          而且它的代码指纹和数据指纹都要和这次一样；模拟数据是演示模式，没做的检查只提醒。
 流水线检验：双击 6-真实光谱检验.bat，或加 --fertility-check。用伊利诺伊的真实平均光谱（标签是受精状态，不是性别）
           把整条流程跑一遍；不保存判断新蛋用的模型，锁文件放在那份数据旁边。
 真实数据必须有 batch 列；确实没有时加 --allow-no-batch（每颗蛋自成一组，结果不能当作对新批次的性能）。
@@ -16,6 +18,7 @@
 最终模型存到 output/egg_model.pt（选了基线时另有 output/baseline_model.pkl），运行文件夹里也留一份。
 """
 import argparse
+import json
 import logging
 import sys
 import time
@@ -31,7 +34,9 @@ import deep_train as dt
 import deploy
 import holdout_lock
 import report
-from baselines import BASELINE_NAMES, LOGREG_C, MATCHED_NAMES, PLS_COMPONENTS, matched_name, per_day_baselines
+import run_record
+from baselines import (BASELINE_NAMES, LOGREG_C, MATCHED_NAMES, PLS_COMPONENTS, PRIMARY_BASELINE, matched_name,
+                       per_day_baselines)
 from controls import run_controls
 from deep_train import PRIMARY_DEEP
 from evaluation import (CHANCE_PASS, CHANCE_UNKNOWN, MIN_HOLDOUT_BATCHES, PRIMARY_METRIC, WILSON_LABEL, batch_utilities,
@@ -40,8 +45,8 @@ from evaluation import (CHANCE_PASS, CHANCE_UNKNOWN, MIN_HOLDOUT_BATCHES, PRIMAR
 from isolation import FoldPlan, IsolationError, audit, plan_folds
 from preprocess_binding import preprocess_settings
 from real_data import eggs_without_batch, load_real_dataset
-from run_record import (EXIT_HOLDOUT_USED, EXIT_SELF_CHECK_FAILED, attach_log, environment, new_run_dir,
-                        reproducibility, save_csv, save_json, set_determinism)
+from run_record import (EXIT_HOLDOUT_USED, EXIT_SELF_CHECK_FAILED, attach_log, data_fingerprint, environment,
+                        new_run_dir, reproducibility, save_csv, save_json, set_determinism)
 from synth_data import EggDataset, make_dataset
 
 # 数据来源：None = 用模拟数据；填 meta.csv 的路径 = 用真实数据
@@ -113,14 +118,20 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def load_data(args: argparse.Namespace) -> EggDataset:
+def load_unshuffled(args: argparse.Namespace) -> EggDataset:
     if args.fertility_check:
-        data = baseline_fertility.as_egg_dataset()
-    else:
-        data = load_real_dataset(args.data) if args.data else make_dataset(seed=SEED)
-    if args.shuffle_labels:      # 按蛋打乱：每颗蛋拿到另一颗蛋的性别
-        return replace(data, sex=np.random.default_rng(SEED).permutation(data.sex))
-    return data
+        return baseline_fertility.as_egg_dataset()
+    return load_real_dataset(args.data) if args.data else make_dataset(seed=SEED)
+
+
+def shuffle_labels(data: EggDataset) -> EggDataset:
+    """按蛋打乱：每颗蛋拿到另一颗蛋的性别。"""
+    return replace(data, sex=np.random.default_rng(SEED).permutation(data.sex))
+
+
+def load_data(args: argparse.Namespace) -> EggDataset:
+    data = load_unshuffled(args)
+    return shuffle_labels(data) if args.shuffle_labels else data
 
 
 def subset(data: EggDataset, idx: np.ndarray) -> EggDataset:
@@ -188,7 +199,9 @@ def prior_holdout_views(hold: EggDataset, args: argparse.Namespace) -> int:
 
 def holdout_used_message(hold: EggDataset, prior: int, path: Path) -> str:
     batches = "、".join(sorted(map(str, np.unique(hold.batch)))[:holdout_lock.MAX_NAMES_IN_KEY])
-    return (f"独立测试集（批次 {batches}）已经被查看过 {prior} 次（记录在 {path}），不能再做正式评估。"
+    broken = holdout_lock.unfinished_views(path, holdout_lock.view_key(hold.batch)) if path.exists() else 0
+    note = f"，其中 {broken} 次中途中断、没记完成绩，也按看过算" if broken else ""
+    return (f"独立测试集（批次 {batches}）已经被查看过 {prior} 次{note}（记录在 {path}），不能再做正式评估。"
             "这次运行已停止：没有训练，没有查看测试集，没有改动任何模型。可以这样继续：\n"
             "  ① 有从没参加过训练的新批次：加 --holdout-batches B10,B11，指定它们当新的独立测试集；\n"
             "  ② 只想重新训练、不看测试集：加 --skip-holdout（测试批次仍然不参加训练，查看次数不变）；\n"
@@ -311,7 +324,7 @@ def evaluate(data: EggDataset, cv: CVResult, run_dir: Path) -> report.Metrics:
 
 
 def batch_report(data: EggDataset, cv: CVResult, day_idx: int, best_base: str, run_dir: Path) -> dict | None:
-    """决策日按批次看：深度模型、最好的基线和它的同样本量版本，每个批次一个决策效用，以批次为单位给区间。
+    """决策日按批次看：深度模型、主比较基线和它的同样本量版本，每个批次一个决策效用，以批次为单位给区间。
     只报告，不参与选择。没有批次信息（每颗蛋自成一组）时不做，返回 None。"""
     names, n_eggs = np.unique(data.batch.astype(str), return_counts=True)
     if len(names) == len(data.sex):
@@ -327,13 +340,13 @@ def batch_report(data: EggDataset, cv: CVResult, day_idx: int, best_base: str, r
 
 
 def decide(data: EggDataset, cv: CVResult, metrics: report.Metrics, day_idx: int, run_dir: Path) -> dict:
-    """决策日：深度模型（累计输出）和最好的基线比，只看事先规定的主指标 PRIMARY_METRIC（决策效用）。
+    """决策日：深度模型（累计输出）和事先指定的基线 PRIMARY_BASELINE 比，只看事先规定的主指标 PRIMARY_METRIC（决策效用）。
 
-    最好的基线 = 主指标平均最高的基线（用全部训练蛋训练的版本，和部署时一致）。共同可判断蛋上的准确率和覆盖率、
-    同样本量对照、按批次的区间都只报告，不参与决定。
+    主比较基线事先固定、不按成绩挑（见 baselines.PRIMARY_BASELINE），所以这一个检验的 p 值是干净的。
+    和其他基线的比较（探索性，不校正）、共同可判断蛋上的准确率和覆盖率、同样本量对照、按批次的区间都只报告，不参与决定。
     """
     primary = {name: m[PRIMARY_METRIC][:, day_idx] for name, m in metrics.items()}
-    best_base = max(BASELINE_NAMES, key=lambda name: np.nan_to_num(report.nanmean(primary[name]), nan=-1.0))
+    best_base = PRIMARY_BASELINE
     cmp = compare_paired(primary[PRIMARY_DEEP], primary[best_base], cv.n_train, cv.n_test)
     common = {b: common_accuracy(cv.scores[PRIMARY_DEEP][:, day_idx], cv.scores[b][:, day_idx], data.sex,
                                  cv.fold_of_egg, cv.n_folds) for b in (*BASELINE_NAMES, *MATCHED_NAMES)}
@@ -343,9 +356,11 @@ def decide(data: EggDataset, cv: CVResult, metrics: report.Metrics, day_idx: int
     matched = matched_name(best_base)       # 同一种基线方法，只是训练样本量和深度模型拉平
     cmp_matched = compare_paired(primary[PRIMARY_DEEP], primary[matched], cv.n_fit, cv.n_test)
     better_matched = report.log_matched(PRIMARY_DEEP, matched, cmp_matched, PRIMARY_METRIC, better)
+    exploratory = exploratory_comparisons(primary, cv, best_base)
     save_csv(run_dir / "decision_day_comparison.csv", report.comparison_rows(metrics, day_idx, PRIMARY_DEEP, common))
     best = common[best_base]
-    return {"主指标": PRIMARY_METRIC, "深度模型": PRIMARY_DEEP, "最好的基线": best_base,
+    return {"主指标": PRIMARY_METRIC, "深度模型": PRIMARY_DEEP, "主比较基线": best_base,
+            "主比较基线的来历": "事先指定（不按交叉验证成绩挑选）", "探索性比较": exploratory,
             "同样本量对照": {"说明": "基线只用深度模型拟合用的那部分蛋训练（不含早停验证集）；只报告，不参与选择",
                              "基线": matched, "平均每折拟合蛋数": cv.n_fit, "平均每折训练蛋数": cv.n_train,
                              "基线决策效用": report.num_or_none(report.nanmean(primary[matched])),
@@ -361,6 +376,20 @@ def decide(data: EggDataset, cv: CVResult, metrics: report.Metrics, day_idx: int
             "基线覆盖率": report.nanmean(metrics[best_base]["coverage"][:, day_idx]),
             "共同可判断蛋上深度模型准确率": report.nanmean(best.acc_a), "共同可判断蛋上基线准确率": report.nanmean(best.acc_b),
             "差值": cmp.diff, "差值95%区间": [cmp.ci_low, cmp.ci_high], "单侧p": cmp.p, "深度模型明显更好": better}
+
+
+def exploratory_comparisons(primary: dict[str, np.ndarray], cv: CVResult, primary_base: str) -> list[dict]:
+    """深度模型和主比较基线以外的基线比：只报告，p 值不校正，不参与选择，也不改变部署的方法。"""
+    rows = []
+    for name in BASELINE_NAMES:
+        if name == primary_base:
+            continue
+        c = compare_paired(primary[PRIMARY_DEEP], primary[name], cv.n_train, cv.n_test)
+        rows.append({"基线": name, "基线决策效用": report.num_or_none(report.nanmean(primary[name])),
+                     "差值": report.num_or_none(c.diff), "单侧p（未校正）": report.num_or_none(c.p)})
+        log.info(f"  探索性比较（不参与选择）：{PRIMARY_DEEP} vs {name} 差值 {rows[-1]['差值']}，"
+                 f"单侧 p {rows[-1]['单侧p（未校正）']}（未校正）")
+    return rows
 
 
 def supplementary(data: EggDataset, cv: CVResult, metrics: report.Metrics, day_idx: int, best_base: str,
@@ -429,7 +458,7 @@ def self_check(data: EggDataset, cv: CVResult, metrics: report.Metrics,
                                      "（各折平均±标准差，应接近 0.5）")
         _log_self_check(statuses, "正常训练的结果先别信")
         return statuses
-    if not args.data and data.days[0] == 0:
+    if gate_mode(args) == MODE_DEMO and data.days[0] == 0:
         statuses = report.log_chance(metrics, [0], cv.n_train, cv.n_test,
                                      "流程自检：模拟数据第 0 天没有性别信号，每种方法这一天的准确率应接近 0.5")
         _log_self_check(statuses, "这次训练的结果先别信")
@@ -444,18 +473,87 @@ def check_record(statuses: dict[str, str] | None) -> dict | None:
     return {"各方法": statuses, "总体": SELF_CHECK_PASS if report.chance_passed(statuses) else SELF_CHECK_FAIL}
 
 
-def release_blockers(check: dict | None, controls: dict) -> list[str]:
+GATE_PASS, GATE_FAIL, GATE_NOT_RUN, GATE_NA = "通过", "未通过", "未执行", "不适用"
+MODE_FORMAL, MODE_DEMO = "正式", "演示"
+
+
+def gate_mode(args: argparse.Namespace) -> str:
+    """真实数据（含真实光谱检验）是正式模式：没做的检查当作没通过；模拟数据是演示模式：没做的检查只提醒。"""
+    return MODE_DEMO if not args.data and not getattr(args, "fertility_check", False) else MODE_FORMAL
+
+
+def self_check_command(args: argparse.Namespace) -> str:
+    if getattr(args, "fertility_check", False):
+        return "py -3.11 train_demo.py --fertility-check --shuffle-labels（网页界面里的“真实光谱自检”）"
+    return f"py -3.11 train_demo.py --data {args.data} --shuffle-labels（网页界面里勾上数据后点“流程自检”）"
+
+
+def find_self_check(repro: dict | None) -> dict | None:
+    """在以前的运行里找打乱标签的流程自检：代码指纹和打乱前的数据指纹都要和这次一样。有几次就取最新的一次。"""
+    if not repro:
+        return None
+    code = (repro.get("代码版本") or {}).get("代码指纹")
+    data_fp = (repro.get("数据指纹") or {}).get("整体")
+    if not code or not data_fp:
+        return None
+    for path in sorted(run_record.RUNS_DIR.glob("*/config.json"), reverse=True):
+        try:
+            config = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        record = config.get("复现") or {}
+        if (config.get("流程自检（打乱标签）") and isinstance(config.get("自检"), dict)
+                and (record.get("代码版本") or {}).get("代码指纹") == code
+                and (record.get("打乱前数据指纹") or {}).get("整体") == data_fp):
+            return {"运行": path.parent.name, "总体": config["自检"].get("总体")}
+    return None
+
+
+def gate_checks(args: argparse.Namespace, data: EggDataset, statuses: dict[str, str] | None, controls: dict,
+                repro: dict | None) -> dict:
+    """发布前的两项检查各是什么状态（通过 / 未通过 / 未执行 / 不适用），写进 config.json 的"发布检查"。"""
+    mode = gate_mode(args)
+    if statuses is not None:
+        check = {"状态": GATE_PASS if report.chance_passed(statuses) else GATE_FAIL, "各方法": statuses,
+                 "依据": "这次运行里第 0 天的检查（模拟数据第 0 天没有性别信号）"}
+    elif mode == MODE_DEMO:
+        check = {"状态": GATE_NOT_RUN, "依据": "模拟数据没有第 0 天，这次运行里没法检查"}
+    else:
+        found = find_self_check(repro)
+        if found is None:
+            check = {"状态": GATE_NOT_RUN,
+                     "依据": f"没找到代码和数据都和这次一样的打乱标签自检，请先运行 {self_check_command(args)}"}
+        else:
+            check = {"状态": GATE_PASS if found["总体"] == SELF_CHECK_PASS else GATE_FAIL, "自检运行": found["运行"],
+                     "依据": f"运行 {found['运行']} 的打乱标签自检（代码和数据指纹都和这次一样），结果：{found['总体']}"}
+    bg = controls.get("背景对照")
+    if bg is not None:
+        background = {"状态": GATE_PASS if bg["结果"] == CHANCE_PASS else GATE_FAIL, "结果": bg["结果"],
+                      "依据": f"只看背景猜性别的准确率 {bg['平均准确率']}"}
+    elif data.bg_spec is None:
+        background = {"状态": GATE_NA, "依据": "没有背景光谱（模拟数据、只有平均光谱的数据，或 ROI_MODE=\"none\"）"}
+    else:
+        background = {"状态": GATE_NOT_RUN, "依据": "有背景光谱，但能用的折太少，没算出来"}
+    return {"模式": mode, "流程自检": check, "背景负对照": background}
+
+
+def release_blockers(gate: dict) -> list[str]:
     """模型发布门控：列出不能保存模型、不能做独立测试的原因；空列表 = 可以发布。
 
-    自检和背景负对照都只认"通过"：报警和无法确认一律拦下（没做的检查不拦）。
+    未通过一律拦下；未执行在正式模式下也拦下（没做的检查不能当作通过），演示模式下只提醒；不适用不拦。
     """
     reasons = []
-    if check is not None and check["总体"] != SELF_CHECK_PASS:
-        bad = "，".join(f"{name}：{status}" for name, status in check["各方法"].items() if status != CHANCE_PASS)
-        reasons.append(f"流程自检未通过（{bad}）")
-    background = controls.get("背景对照")
-    if background is not None and background["结果"] != CHANCE_PASS:
-        reasons.append(f"背景负对照{background['结果']}（只看背景猜性别的准确率 {background['平均准确率']}）")
+    for name in ("流程自检", "背景负对照"):
+        item = gate[name]
+        if item["状态"] == GATE_FAIL:
+            detail = item["依据"]
+            if "各方法" in item:
+                detail = "，".join(f"{m}：{s}" for m, s in item["各方法"].items() if s != CHANCE_PASS)
+            elif "结果" in item:
+                detail = f"{item['结果']}，{item['依据']}"
+            reasons.append(f"{name}未通过（{detail}）")
+        elif item["状态"] == GATE_NOT_RUN and gate["模式"] == MODE_FORMAL:
+            reasons.append(f"{name}未执行（{item['依据']}）——正式模式下没做的检查不能当作通过")
     return reasons
 
 
@@ -480,14 +578,20 @@ def run_config(args: argparse.Namespace, data: EggDataset, dev_weight: float, cv
 def run_holdout(final: deploy.FinalModels, hold: EggDataset, args: argparse.Namespace, day_idx: int,
                 chosen: str, run_dir: Path) -> dict:
     """独立测试集评估：只有第一次查看是正式结果。已经看过的测试集默认拦下（HoldoutUsedError）；
-    调试模式（--debug-holdout）可以再看，但所有输出都标注"非独立验证"，仍然记一次查看。返回写进配置的内容。"""
+    调试模式（--debug-holdout）可以再看，但所有输出都标注"非独立验证"，仍然记一次查看。返回写进配置的内容。
+
+    先记后看：算成绩之前就在锁文件里记一笔"进行中"，之后不管在哪一步中断都按看过算；
+    检查和记录是一次独占操作，两个训练同时跑到这里，只有一个拿得到正式查看。"""
     path = holdout_lock.lock_path(args.data)
     egg_hash = holdout_lock.holdout_hash(hold.egg_ids)
     ids_hash = holdout_lock.view_key(hold.batch)
-    prior = prior_holdout_views(hold, args)
-    if prior and not args.debug_holdout:
-        raise HoldoutUsedError(holdout_used_message(hold, prior, path))
+    prior_holdout_views(hold, args)                     # 顺带把旧格式的记录并进批次键
     changed = holdout_lock.egg_change_note(path, ids_hash, egg_hash, len(hold.egg_ids))
+    try:
+        prior = holdout_lock.begin_view(path, ids_hash, run_dir.name, chosen, len(hold.egg_ids), egg_hash,
+                                        allow_repeat=args.debug_holdout)
+    except holdout_lock.AlreadyViewed as e:
+        raise HoldoutUsedError(holdout_used_message(hold, e.prior, path)) from None
     if prior and changed:
         log.warning(f"\n!!! 独立测试批次里的蛋和上次查看时不一样（{changed}）：测试集被改过，查看次数仍然累计 !!!")
     n_batches = len(np.unique(hold.batch))
@@ -503,33 +607,39 @@ def run_holdout(final: deploy.FinalModels, hold: EggDataset, args: argparse.Name
     rows, tables = deploy.evaluate_holdout(final, hold, day_idx, chosen, views, formal)
     save_csv(run_dir / (HOLDOUT_CSV if formal else HOLDOUT_DEBUG_CSV), rows)
     total = tables[chosen][0]
-    holdout_lock.record_view(path, ids_hash, run_dir.name, chosen,
+    holdout_lock.finish_view(path, ids_hash, run_dir.name,
                              {"蛋数": total.n_eggs, "判断数": total.judged, "判对数": total.correct,
-                              "覆盖率": report.num_or_none(total.coverage), "决策效用": report.num_or_none(total.utility)},
-                             n_eggs=len(hold.egg_ids), egg_hash=egg_hash, formal=formal)
+                              "覆盖率": report.num_or_none(total.coverage), "决策效用": report.num_or_none(total.utility)})
     return {"蛋数": len(hold.sex), "批次": sorted(map(str, np.unique(hold.batch))), "holdout_views": views,
             "正式结果": formal, "性质": report.FORMAL_RESULT if formal else report.NOT_INDEPENDENT,
             "区间说明": WILSON_LABEL, "按批次决策效用": report.holdout_batch_interval(tables[chosen])}
 
 
 def finish(data: EggDataset, hold: EggDataset | None, cv: CVResult, metrics: report.Metrics,
-           args: argparse.Namespace, dev_weight: float, run_dir: Path) -> dict:
+           args: argparse.Namespace, dev_weight: float, run_dir: Path, repro: dict | None = None) -> dict:
     """正常训练的收尾：决策日选方法、发育报告、自检、最终模型、独立测试。返回写进配置的内容。"""
     day_idx = decision_index(data.days, args.decision_day)
     result = decide(data, cv, metrics, day_idx, run_dir)
-    chosen = PRIMARY_DEEP if result["深度模型明显更好"] else result["最好的基线"]
+    chosen = PRIMARY_DEEP if result["深度模型明显更好"] else result["主比较基线"]
     save_csv(run_dir / "dev_mae.csv", report.log_dev(data, cv.dev_pred))
-    extra = {"决策日结果": result, "部署方法": chosen, "自检": check_record(self_check(data, cv, metrics, args)),
+    statuses = self_check(data, cv, metrics, args)
+    extra = {"决策日结果": result, "部署方法": chosen, "自检": check_record(statuses),
              "负对照": run_controls(data, cv.fold_of_egg, day_idx, cv.n_train, cv.n_test),
-             "补充分析": supplementary(data, cv, metrics, day_idx, result["最好的基线"], run_dir)}
-    blockers = release_blockers(extra["自检"], extra["负对照"])
+             "补充分析": supplementary(data, cv, metrics, day_idx, result["主比较基线"], run_dir)}
+    gate = gate_checks(args, data, statuses, extra["负对照"], repro)
+    extra["发布检查"] = gate
+    log.info(f"\n发布检查（{gate['模式']}模式）：流程自检 {gate['流程自检']['状态']}，背景负对照 {gate['背景负对照']['状态']}")
+    for name in ("流程自检", "背景负对照"):
+        if gate[name]["状态"] == GATE_NOT_RUN and gate["模式"] == MODE_DEMO:
+            log.warning(f"  提醒：{name}没做（{gate[name]['依据']}）。演示模式放行，正式数据上会被拦下")
+    blockers = release_blockers(gate)
     extra["模型发布"] = {"已发布": not blockers, "未发布原因": blockers}
     if blockers:        # 发布门控：检查没通过就到此为止，不训练最终模型、不碰独立测试集、不写任何模型文件
         log.error(f"\n!!! 质量检查没通过，这次不保存模型，也不做独立测试（{'；'.join(blockers)}）。"
                   "output 文件夹里上一次通过检查的模型原样保留；独立测试集没有被查看，查看次数不变。"
                   "这次的运行文件夹里只有诊断记录 !!!")
         return extra
-    final = deploy.train_final(data, cv.best_epochs, dev_weight, result["最好的基线"], SEED)
+    final = deploy.train_final(data, cv.best_epochs, dev_weight, result["主比较基线"], SEED)
     if hold is not None:
         extra["独立测试集"] = run_holdout(final, hold, args, day_idx, chosen, run_dir)
         extra["holdout_views"] = extra["独立测试集"]["holdout_views"]
@@ -554,8 +664,11 @@ def main() -> int:
     set_determinism(SEED)
     if args.fertility_check:
         log.warning(FERTILITY_NOTE)
-    data_all = load_data(args)
+    raw = load_unshuffled(args)
+    data_all = shuffle_labels(raw) if args.shuffle_labels else raw
     repro = reproducibility(run_dir, data_all, args.data)
+    if args.shuffle_labels:         # 正式训练的发布门控靠它找到对应的自检：数据指纹要和打乱之前比
+        repro["打乱前数据指纹"] = data_fingerprint(raw, args.data)
     check_batches(data_all, args)
     decision_index(data_all.days, args.decision_day)
     dev_weight = dt.DEV_LOSS_WEIGHT if data_all.dev_mask.any() else 0.0
@@ -590,7 +703,13 @@ def main() -> int:
     if args.shuffle_labels:
         config["自检"] = check_record(self_check(data, cv, metrics, args))
     else:
-        config.update(finish(data, hold, cv, metrics, args, dev_weight, run_dir))
+        try:
+            config.update(finish(data, hold, cv, metrics, args, dev_weight, run_dir, repro))
+        except HoldoutUsedError as e:     # 训练期间别的进程抢先看了这个测试集：不看、不保存模型
+            log.error(f"\n!!! 已拦截：{e}")
+            config["已拦截"] = str(e)
+            save_json(run_dir / "config.json", config)
+            return EXIT_HOLDOUT_USED
     if args.fertility_check:
         config["标签含义"] = FERTILITY_NOTE
         log.warning(f"\n{FERTILITY_NOTE}")

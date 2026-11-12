@@ -12,6 +12,10 @@ from sklearn.preprocessing import StandardScaler
 PLS_COMPONENTS = 10
 LOGREG_C = 0.1
 BASELINE_NAMES = ("PLS-DA", "逻辑回归")
+# 事先指定的主比较基线：深度模型只和它做正式检验，深度模型没有明显更好时也部署它。
+# 不按交叉验证成绩挑基线——先挑成绩最高的再拿同一份结果检验，p 值没有把"挑"这一步算进去。
+# 选 PLS-DA 是因为它是光谱分类最常用的方法；其他基线的比较只作探索性报告。
+PRIMARY_BASELINE = "PLS-DA"
 MATCHED_SUFFIX = "·等样本"      # 同样本量对照：基线只用深度模型拟合用的那部分蛋训练（不含早停验证集）
 
 

@@ -75,7 +75,7 @@ def log_decision_day(day: int, t: int, metrics: Metrics, deep: str, base: str, c
     """决策日：各方法的决策效用（主指标）、覆盖率、只在判断了的蛋上算的准确率，以及两两在共同可判断蛋上的准确率。
     决策效用同时给"各折平均"和"合并全部折外预测按蛋算"两种；检验和选择用各折平均（事先规定）。
 
-    返回深度模型的主指标有没有明显好过最好的基线。
+    返回深度模型的主指标有没有明显好过事先指定的主比较基线。
     """
     name = METRIC_NAMES.get(metric, metric)
     log.info(f"\n★ 决策日（第 {day} 天）交叉验证结果，各折平均±标准差")
@@ -93,7 +93,7 @@ def log_decision_day(day: int, t: int, metrics: Metrics, deep: str, base: str, c
                  f"平均每折 {np.mean(c.n_common):.1f} 颗")
     better = bool(cmp.p < ALPHA)
     ci = "无法估计" if np.isnan(cmp.ci_low) else f"[{cmp.ci_low:+.3f}, {cmp.ci_high:+.3f}]"
-    log.info(f"  → {deep}比最好的基线（{base}）{name}平均高 {cmp.diff:+.3f}，95% 置信区间 {ci}，单侧 p = {_p(cmp.p)}"
+    log.info(f"  → {deep}比事先指定的基线（{base}）{name}平均高 {cmp.diff:+.3f}，95% 置信区间 {ci}，单侧 p = {_p(cmp.p)}"
              f"（配对 t 检验，已按交叉验证校正）：{'明显好过' if better else '没有明显好过'}基线")
     if not better:
         log.info(f"    按流程规定：深度模型没有明显好过基线时，判断新蛋改用 {base}")

@@ -111,15 +111,15 @@ class TestFailureCases(unittest.TestCase):
 
 class TestRepeatSummary(unittest.TestCase):
     def test_spread_and_stability(self) -> None:
-        rows = [{"深度决策效用": 0.8, "基线决策效用": 0.7, "差值": 0.1, "深度明显更好": True, "最好的基线": "A",
+        rows = [{"深度决策效用": 0.8, "基线决策效用": 0.7, "差值": 0.1, "深度明显更好": True, "主比较基线": "A",
                  "按规则部署": "深"},
-                {"深度决策效用": 0.6, "基线决策效用": 0.7, "差值": -0.1, "深度明显更好": False, "最好的基线": "A",
+                {"深度决策效用": 0.6, "基线决策效用": 0.7, "差值": -0.1, "深度明显更好": False, "主比较基线": "A",
                  "按规则部署": "A"}]
         s = repeat_cv.summarize(rows)
         self.assertEqual(s["深度决策效用"]["平均"], 0.7)
         self.assertEqual(s["深度明显更好的遍数"], 1)
         self.assertFalse(s["部署决定是否每遍相同"])
-        self.assertTrue(s["最好的基线是否每遍相同"])
+        self.assertNotIn("最好的基线是否每遍相同", s)               # 主比较基线事先指定，不会每遍变
 
 
 TINY = mock.patch.object(train_demo, "make_dataset", side_effect=lambda seed: make_dataset(32, seed))

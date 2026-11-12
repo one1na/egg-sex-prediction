@@ -134,7 +134,9 @@ class TestRealDataChain(EndToEndBase):
         self.assertTrue(all(r["正式结果"] == "1" for r in holdout))
         self.assertIn("深度模型决策效用（合并按蛋）", config["决策日结果"])
         matched = config["决策日结果"]["同样本量对照"]                        # 基线只用深度模型拟合的那部分蛋
-        self.assertEqual(matched["基线"], config["决策日结果"]["最好的基线"] + "·等样本")
+        self.assertEqual(config["决策日结果"]["主比较基线"], "PLS-DA")                 # 事先指定，不按成绩挑
+        self.assertEqual([r["基线"] for r in config["决策日结果"]["探索性比较"]], ["逻辑回归"])
+        self.assertEqual(matched["基线"], "PLS-DA·等样本")
         self.assertLess(matched["平均每折拟合蛋数"], matched["平均每折训练蛋数"])
         self.assertIn(matched["基线"], {r["方法"] for r in read_csv(run / "results_per_day.csv")})
         self.assertIn(matched["基线"], {r["对比基线"] for r in read_csv(run / "decision_day_comparison.csv")})
@@ -220,8 +222,11 @@ class TestRealDataChain(EndToEndBase):
         with mock.patch.object(train_demo, "run_controls", return_value=controls):
             run = self.train("--data", self.csv, force_release=False)
         config = self.config(run)
-        self.assertEqual(self.exit_code, 2)                                  # 自检没做也算没通过
-        self.assertIn("背景负对照", config["模型发布"]["未发布原因"][0])
+        self.assertEqual(self.exit_code, 2)
+        reasons = config["模型发布"]["未发布原因"]                         # 真实数据还没做自检，两条原因都列出
+        self.assertEqual(len(reasons), 2)
+        self.assertIn("流程自检未执行", reasons[0])
+        self.assertIn("背景负对照未通过", reasons[1])
         self.assertFalse((self.out / "egg_model.pt").exists())
         self.assert_no_model_in(run)
         self.assertEqual(self.lock_evaluations(), [])
@@ -249,6 +254,35 @@ class TestRealDataChain(EndToEndBase):
         check = train_demo.check_record
         self.assertEqual([train_demo.exit_code(check(s)) for s in
                           ({"a": "通过"}, {"a": "报警"}, {"a": "通过", "b": "无法确认"}, None)], [0, 2, 2, 0])
+
+    def test_formal_release_needs_matching_self_check(self) -> None:
+        """真实数据不替换发布门控：没有对应的打乱标签自检就不发布；自检的代码和数据指纹都对得上才发布。
+
+        负对照换成固定的"通过"（这么小的数据上统计量说不准），自检状态也在打乱标签那次固定成"通过"；
+        要检查的是"找没找到对应的自检"这条规则本身。"""
+        passed = {"批次可分性": None, "背景对照": {"各折准确率": [0.5], "平均准确率": 0.5, "单侧p": 0.5, "结果": "通过"}}
+        with mock.patch.object(train_demo, "run_controls", return_value=passed):
+            run = self.train("--data", self.csv, force_release=False)
+            gate = self.config(run)["发布检查"]
+            self.assertEqual((self.exit_code, gate["模式"], gate["流程自检"]["状态"]), (2, "正式", "未执行"))
+            self.assertNotIn("holdout_views", self.config(run))                 # 没看独立测试集
+            self.assertFalse((self.out / "egg_model.pt").exists())
+
+            with mock.patch.object(train_demo, "self_check", return_value={"深度-累计": "通过", "PLS-DA": "通过"}):
+                check_run = self.train("--data", self.csv, "--shuffle-labels", force_release=False)
+            self.assertEqual(self.exit_code, 0)
+            self.assertIn("打乱前数据指纹", self.config(check_run)["复现"])
+
+            run = self.train("--data", self.csv, force_release=False)
+            gate = self.config(run)["发布检查"]
+            self.assertEqual((self.exit_code, gate["流程自检"]["状态"], gate["流程自检"]["自检运行"]),
+                             (0, "通过", check_run.name))
+            self.assertEqual(self.config(run)["holdout_views"], 1)
+            self.assertTrue((self.out / "egg_model.pt").exists())
+
+            with mock.patch.object(run_record, "code_hash", return_value="代码改过了"):
+                run = self.train("--data", self.csv, "--skip-holdout", force_release=False)
+            self.assertEqual((self.exit_code, self.config(run)["发布检查"]["流程自检"]["状态"]), (2, "未执行"))
 
     def test_shuffle_labels_does_not_touch_lock(self) -> None:
         run = self.train("--data", self.csv, "--shuffle-labels")
