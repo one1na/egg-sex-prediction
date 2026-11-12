@@ -122,6 +122,10 @@ class TestRealDataChain(EndToEndBase):
         config = json.loads((run / "config.json").read_text(encoding="utf-8"))
         self.assertEqual(config["holdout_views"], 1)
         self.assertEqual(config["主指标"], "utility")
+        repro = config["复现"]          # 复现记录：代码版本、数据指纹（含数据表本身）、依赖核对
+        self.assertIn("代码指纹", repro["代码版本"])
+        self.assertEqual(set(repro["数据指纹"]), {"图像", "标签", "整体", "数据表"})
+        self.assertIn("一致", repro["依赖版本"])
         self.assertTrue((run / "decision_day_comparison.csv").exists())
         holdout = read_csv(run / "holdout.csv")
         self.assertIn("全部", {r["范围"] for r in holdout})

@@ -30,7 +30,7 @@ import deep_train as dt
 from baselines import per_day_baselines
 from evaluation import (ALPHA, PRIMARY_METRIC, Paired, batch_utilities, compare_paired, fold_day_metrics,
                         group_interval, inner_split, outer_folds)
-from run_record import attach_log, environment, new_run_dir, save_csv, save_json
+from run_record import attach_log, environment, new_run_dir, reproducibility, save_csv, save_json, set_determinism
 from synth_data import EggDataset
 from train_demo import DECISION_DAY, N_FOLDS, SEED, check_batches, decision_index, load_data, split_holdout
 
@@ -263,9 +263,11 @@ def main() -> int:
     args = parse_args()
     run_dir = new_run_dir("消融实验")
     attach_log(run_dir)
+    set_determinism(SEED)
     if not args.data:
         log.warning(SYNTH_NOTE)
     data_all = load_data(args)
+    repro = reproducibility(run_dir, data_all, args.data)
     check_batches(data_all, args)
     day_idx = decision_index(data_all.days, args.decision_day)
     dev_weight = dt.DEV_LOSS_WEIGHT if data_all.dev_mask.any() else 0.0
@@ -290,7 +292,8 @@ def main() -> int:
         "开发集蛋数": len(data.sex), "发育损失权重": dev_weight, "基线": BASELINE, "波段分段数": BAND_GROUPS,
         "比较项数": n_comparisons(variants), "显著性水平": ALPHA,
         "校正后门槛": ALPHA / max(1, n_comparisons(variants)),
-        "变体": [{"名字": v.name, "回答的问题": v.question} for v in variants], "环境": environment()})
+        "变体": [{"名字": v.name, "回答的问题": v.question} for v in variants], "环境": environment(),
+        "复现": repro})
     log.info(f"\n这次消融的全部记录在：{run_dir}")
     return 0
 

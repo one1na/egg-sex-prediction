@@ -38,8 +38,8 @@ from evaluation import (CHANCE_PASS, CHANCE_UNKNOWN, MIN_HOLDOUT_BATCHES, PRIMAR
                         fold_day_metrics, holdout_split, inner_split, outer_folds, pooled_utility)
 from preprocess_binding import preprocess_settings
 from real_data import eggs_without_batch, load_real_dataset
-from run_record import (EXIT_HOLDOUT_USED, EXIT_SELF_CHECK_FAILED, attach_log, environment, new_run_dir, save_csv,
-                        save_json)
+from run_record import (EXIT_HOLDOUT_USED, EXIT_SELF_CHECK_FAILED, attach_log, environment, new_run_dir,
+                        reproducibility, save_csv, save_json, set_determinism)
 from synth_data import EggDataset, make_dataset
 
 # 数据来源：None = 用模拟数据；填 meta.csv 的路径 = 用真实数据
@@ -506,9 +506,11 @@ def main() -> int:
         kind = "真实光谱自检" if args.shuffle_labels else "真实光谱检验"
     run_dir = new_run_dir(kind)
     attach_log(run_dir)
+    set_determinism(SEED)
     if args.fertility_check:
         log.warning(FERTILITY_NOTE)
     data_all = load_data(args)
+    repro = reproducibility(run_dir, data_all, args.data)
     check_batches(data_all, args)
     decision_index(data_all.days, args.decision_day)
     dev_weight = dt.DEV_LOSS_WEIGHT if data_all.dev_mask.any() else 0.0
@@ -520,12 +522,14 @@ def main() -> int:
         except HoldoutUsedError as e:
             log.error(f"\n!!! 已拦截：{e}")
             save_json(run_dir / "config.json", {"时间": datetime.now().isoformat(timespec="seconds"),
-                                                "数据": args.data or "模拟数据", "已拦截": str(e)})
+                                                "数据": args.data or "模拟数据", "已拦截": str(e),
+                                                "复现": repro})
             return EXIT_HOLDOUT_USED
 
     cv = cross_validate(data, dev_weight)
     metrics = evaluate(data, cv, run_dir)
     config = run_config(args, data, dev_weight, cv)
+    config["复现"] = repro
     if args.shuffle_labels:
         config["自检"] = check_record(self_check(data, cv, metrics, args))
     else:
