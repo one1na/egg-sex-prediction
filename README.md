@@ -34,6 +34,8 @@ python web_app.py                        # 网页界面
 python -m unittest discover -s tests     # 自动化测试
 ```
 
+推送到 GitHub 后，单元测试会在 Linux 和 Windows 上自动各跑一遍（`.github/workflows/tests.yml`）；在仓库的 Actions 页面手动运行时，可以勾选同时跑完整验收测试。
+
 完整说明见 [使用说明.md](使用说明.md)。
 
 ## 数据
