@@ -19,7 +19,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 logging.disable(logging.WARNING)
 
-import gui  # noqa: E402
+import gui_messages  # noqa: E402
 import holdout_lock  # noqa: E402
 import real_data  # noqa: E402
 import report  # noqa: E402
@@ -332,8 +332,8 @@ class TestHoldoutOnlyOnce(unittest.TestCase):
 
     def test_exit_code_and_gui_message(self) -> None:
         self.assertEqual((EXIT_SELF_CHECK_FAILED, EXIT_HOLDOUT_USED), (2, 3))
-        message = gui.failure_message("训练", EXIT_HOLDOUT_USED)
-        self.assertTrue(message.startswith(gui.HOLDOUT_MARK))
+        message = gui_messages.failure_message("训练", EXIT_HOLDOUT_USED)
+        self.assertTrue(message.startswith(gui_messages.HOLDOUT_MARK))
         self.assertNotIn("截图", message)
 
 
